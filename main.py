@@ -1,60 +1,47 @@
 import os
 import json
 import requests
-import smtplib
-from email.message import EmailMessage
 from typing import List
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
-# --- Config: OpenAI ---
+# --- Config: OpenAI + Resend ---
+
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-if not OPENAI_API_KEY:
-    print("WARNING: OPENAI_API_KEY is not set. /run_scan will fail until it is configured.")
-
-# --- Config: Email notifications ---
-SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-NOTIFY_EMAIL_FROM = os.getenv("NOTIFY_EMAIL_FROM")
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO")
+NOTIFY_EMAIL_FROM = os.getenv("NOTIFY_EMAIL_FROM")  # optional
 
-def notifications_configured() -> bool:
-    return all([
-        SMTP_HOST,
-        SMTP_PORT,
-        SMTP_USER,
-        SMTP_PASSWORD,
-        NOTIFY_EMAIL_FROM,
-        NOTIFY_EMAIL_TO,
-    ])
+if not OPENAI_API_KEY:
+    print("[VizAI] WARNING: OPENAI_API_KEY is not set. /run_scan will fail.")
 
-if not notifications_configured():
-    print("[VizAI] Email notifications are NOT fully configured yet.")
+if RESEND_API_KEY and NOTIFY_EMAIL_TO:
+    print("[VizAI] Email notifications are enabled (Resend).")
 else:
-    print("[VizAI] Email notifications are enabled.")
+    print("[VizAI] Email notifications are DISABLED (missing RESEND_API_KEY or NOTIFY_EMAIL_TO).")
 
 # --- FastAPI app setup ---
+
 app = FastAPI(title="VizAI Scan API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict to https://vizai.io later
+    allow_origins=["*"],  # in prod you can restrict to https://vizai.io
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # --- Models ---
+
 class ScanRequest(BaseModel):
     businessName: str
     website: HttpUrl
-    models: List[str] = []  # kept for future use
+    models: List[str] = []  # kept for future, currently unused
 
 
 class ScanResponse(BaseModel):
@@ -62,27 +49,26 @@ class ScanResponse(BaseModel):
     accuracy_score: int
     authority_score: int
     findings: List[str]
-    recommended_package: str
-    strategy: str
 
 
-# --- OpenAI call ---
+# --- Core LMO analysis using OpenAI ---
+
 def run_lmo_analysis(business_name: str, website: str, models: List[str]) -> ScanResponse:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured on the server.")
 
-    models_str = ", ".join(models) if models else "ChatGPT (simulated only)"
+    models_str = ", ".join(models) if models else "not specified"
 
     prompt = f"""
-You are an expert in Language Model Optimization (LMO) and AI visibility diagnostics.
+You are an expert in Language Model Optimization (LMO).
 
-A business has requested a VizAI visibility scan.
+A business has requested an LMO-style scan.
 
 Business name: {business_name}
 Website: {website}
-Models selected (for context only): {models_str}
+Models selected: {models_str}
 
-You are NOT actually browsing the web; you are estimating how a typical set of current LLMs would see this business based on the name and domain alone.
+You are NOT actually browsing the web; instead, you are estimating how a typical set of current LLMs would likely see this business based on the name + domain alone.
 
 Return a single JSON object with this exact structure:
 
@@ -142,89 +128,85 @@ Rules:
             detail=f"Failed to parse LLM JSON: {str(e)} | content={content}",
         )
 
-    discovery = int(parsed.get("discovery_score", 50))
-    accuracy = int(parsed.get("accuracy_score", 50))
-    authority = int(parsed.get("authority_score", 50))
-    findings = parsed.get("findings", ["No findings returned."])
-
-    # Package suggestion logic
-    avg_score = (discovery + accuracy + authority) / 3.0
-
-    if avg_score >= 80:
-        recommended = "Basic"
-        strategy = (
-            "You have strong AI visibility today. The VizAI Basic package focuses on keeping your "
-            "facts current, monitoring for drift, and making light updates so your scores stay high "
-            "as models evolve."
-        )
-    elif avg_score >= 40:
-        recommended = "Standard"
-        strategy = (
-            "Your AI visibility is uneven. The VizAI Standard package helps stabilize how models "
-            "describe you by improving structured data, tightening your core narrative, and adding "
-            "regular drift monitoring."
-        )
-    else:
-        recommended = "Standard + Add-Ons"
-        strategy = (
-            "Your scores suggest that AI models either can’t find you reliably or don’t understand "
-            "your offer. We recommend VizAI Standard plus add-ons like API Documentation Publishing, "
-            "Schema Deployment, and Competitor Deep Dive to rebuild your presence from the ground up."
-        )
-
     return ScanResponse(
-        discovery_score=discovery,
-        accuracy_score=accuracy,
-        authority_score=authority,
-        findings=findings,
-        recommended_package=recommended,
-        strategy=strategy,
+        discovery_score=int(parsed.get("discovery_score", 50)),
+        accuracy_score=int(parsed.get("accuracy_score", 50)),
+        authority_score=int(parsed.get("authority_score", 50)),
+        findings=parsed.get("findings", ["No findings returned."]),
     )
 
 
-# --- Email notification helper ---
-def send_scan_notification(req: ScanRequest, res: ScanResponse) -> None:
-    if not notifications_configured():
-        print("[VizAI] Skipping email notification – SMTP / NOTIFY env vars incomplete.")
+# --- Package recommendation logic for notifications ---
+
+def recommend_package(avg_score: int) -> str:
+    if avg_score >= 80:
+        return "Basic"
+    if avg_score >= 40:
+        return "Standard"
+    return "Standard + Add-Ons"
+
+
+# --- Resend email helper ---
+
+def send_notification_email(
+    business_name: str,
+    website: str,
+    scores: ScanResponse,
+) -> None:
+    """Send scan summary to your inbox via Resend."""
+    if not (RESEND_API_KEY and NOTIFY_EMAIL_TO):
+        print("[VizAI] Skipping notification email (missing RESEND_API_KEY or NOTIFY_EMAIL_TO).")
         return
 
+    avg_score = (scores.discovery_score + scores.accuracy_score + scores.authority_score) // 3
+    recommended_tier = recommend_package(avg_score)
+
+    subject = f"[VizAI Scan] {business_name} – Avg {avg_score}"
+
+    html_body = f"""
+    <h2>New VizAI Scan Result</h2>
+    <p><strong>Business:</strong> {business_name}</p>
+    <p><strong>Website:</strong> {website}</p>
+    <p><strong>Scores:</strong></p>
+    <ul>
+      <li>Discovery: {scores.discovery_score}</li>
+      <li>Accuracy: {scores.accuracy_score}</li>
+      <li>Authority: {scores.authority_score}</li>
+    </ul>
+    <p><strong>Average score:</strong> {avg_score}</p>
+    <p><strong>Suggested package:</strong> {recommended_tier}</p>
+    <p><strong>Findings:</strong></p>
+    <ul>
+      {''.join(f'<li>{f}</li>' for f in scores.findings)}
+    </ul>
+    <hr/>
+    <p>This notification was sent automatically by VizAI Scan.</p>
+    """
+
+    from_address = NOTIFY_EMAIL_FROM or "VizAI Scan <onboarding@resend.dev>"
+
+    headers = {
+        "Authorization": f"Bearer {RESEND_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "from": from_address,
+        "to": [NOTIFY_EMAIL_TO],
+        "subject": subject,
+        "html": html_body,
+    }
+
     try:
-        msg = EmailMessage()
-        msg["Subject"] = f"[VizAI Scan] {req.businessName} – Avg score {round((res.discovery_score + res.accuracy_score + res.authority_score)/3)}"
-        msg["From"] = NOTIFY_EMAIL_FROM
-        msg["To"] = NOTIFY_EMAIL_TO
-
-        avg_score = (res.discovery_score + res.accuracy_score + res.authority_score) / 3.0
-
-        body = f"""New VizAI scan submitted:
-
-Business: {req.businessName}
-Website: {req.website}
-
-Scores:
-- Discovery: {res.discovery_score}
-- Accuracy:  {res.accuracy_score}
-- Authority: {res.authority_score}
-- Average:   {avg_score:.1f}
-
-Recommended package: {res.recommended_package}
-
-Strategy:
-{res.strategy}
-
-Findings:
-- """ + "\n- ".join(res.findings) + "\n"
-
-        msg.set_content(body)
-
-        print("[VizAI] Attempting to send notification email...")
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASSWORD)
-            server.send_message(msg)
-        print("[VizAI] Notification email sent successfully.")
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers=headers,
+            json=payload,
+            timeout=15,
+        )
+        resp.raise_for_status()
+        print("[VizAI] Notification email sent via Resend.")
     except Exception as e:
-        print(f"[VizAI] Failed to send notification email: {e}")
+        print(f"[VizAI] Failed to send notification email via Resend: {e}")
 
 
 # --- API endpoints ---
@@ -238,10 +220,19 @@ def run_scan(payload: ScanRequest):
             models=payload.models,
         )
 
-        # Fire-and-forget notification
-        send_scan_notification(payload, result)
+        # fire-and-forget notification
+        try:
+            send_notification_email(
+                business_name=payload.businessName,
+                website=str(payload.website),
+                scores=result,
+            )
+        except Exception as e:
+            # don't break the scan if email fails
+            print(f"[VizAI] Error during notification send (non-fatal): {e}")
 
         return result
+
     except HTTPException:
         raise
     except Exception as e:
@@ -250,26 +241,29 @@ def run_scan(payload: ScanRequest):
 
 @app.get("/test_email")
 def test_email():
-    """Quick health-check for notification setup."""
-    if not notifications_configured():
-        return {"status": "notifications_not_configured"}
-
-    dummy_req = ScanRequest(
-        businessName="VizAI Test Business",
-        website="https://example.com",
-        models=["chatgpt"],
-    )
-    dummy_res = ScanResponse(
-        discovery_score=70,
-        accuracy_score=65,
-        authority_score=60,
-        findings=["Test finding 1", "Test finding 2"],
-        recommended_package="Standard",
-        strategy="This is a test strategy message from /test_email.",
+    """Manual test endpoint to confirm Resend + env vars work."""
+    dummy_scores = ScanResponse(
+        discovery_score=72,
+        accuracy_score=68,
+        authority_score=61,
+        findings=[
+            "Test run only – no real scan performed.",
+            "This verifies that Resend + notification pipeline works.",
+        ],
     )
 
-    send_scan_notification(dummy_req, dummy_res)
-    return {"status": "notification_attempted"}
+    try:
+        send_notification_email(
+            business_name="VizAI Test Business",
+            website="https://vizai.io",
+            scores=dummy_scores,
+        )
+        return {"status": "notification_attempted"}
+    except Exception as e:
+        # Don't expose internals, just log them
+        print(f"[VizAI] /test_email error: {e}")
+        raise HTTPException(status_code=500, detail="Failed to attempt notification.")
+
 
 
 
