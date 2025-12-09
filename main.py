@@ -236,6 +236,29 @@ Rules:
 
 
 # --- API endpoint ---
+@app.get("/test_email")
+def test_email():
+    """Quick check to see if email notifications are wired correctly."""
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD and NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO):
+        return {"status": "notifications_not_configured"}
+
+    dummy_req = ScanRequest(
+        businessName="Test Business",
+        website="https://example.com",
+        models=["chatgpt"]
+    )
+    dummy_res = ScanResponse(
+        discovery_score=70,
+        accuracy_score=65,
+        authority_score=60,
+        findings=["Test finding 1", "Test finding 2"],
+        recommended_package="Standard",
+        strategy="This is a test strategy message."
+    )
+
+    send_scan_notification(dummy_req, dummy_res)
+    return {"status": "notification_attempted"}
+
 @app.post("/run_scan", response_model=ScanResponse)
 def run_scan(payload: ScanRequest):
     try:
