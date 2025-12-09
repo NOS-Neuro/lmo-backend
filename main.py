@@ -12,27 +12,25 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # adjust if you prefer a different model
 
 if not OPENAI_API_KEY:
-    # Render will set this; locally you'll set it in your shell
     print("WARNING: OPENAI_API_KEY is not set. The /run_scan endpoint will fail until it is configured.")
 
 # --- FastAPI app setup ---
-app = FastAPI(title="LuminAI Scan API")
+app = FastAPI(title="VizAI Scan API")
 
-# CORS: in production, you can restrict to your HF Space URL
+# CORS: in production, you can restrict to your Vercel / HF Space URL
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # e.g. ["https://your-space-name.hf.space"]
+    allow_origins=["*"],  # e.g. ["https://www.vizai.io"]
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 # --- Request/Response models ---
 class ScanRequest(BaseModel):
     businessName: str
     website: HttpUrl
-    models: List[str] = []  # e.g. ["chatgpt", "claude", "gemini"]
+    models: List[str] = []  # currently unused, but kept for future extension
 
 
 class ScanResponse(BaseModel):
@@ -40,6 +38,8 @@ class ScanResponse(BaseModel):
     accuracy_score: int
     authority_score: int
     findings: List[str]
+    recommended_package: str
+    strategy: str
 
 
 # --- Helper: call OpenAI for LMO-style analysis ---
@@ -49,16 +49,40 @@ def run_lmo_analysis(business_name: str, website: str, models: List[str]) -> Sca
 
     models_str = ", ".join(models) if models else "not specified"
 
+    # Core prompt for VizAI / LMO-style scan
     prompt = f"""
-You are an expert in Language Model Optimization (LMO).
+You are an expert in Language Model Optimization (LMO) and AI visibility diagnostics.
 
-A business has requested an LMO-style scan.
+A business has requested a VizAI-style scan.
 
 Business name: {business_name}
 Website: {website}
 Models selected: {models_str}
 
-You are NOT actually browsing the web; instead, you are estimating how a typical set of current LLMs would likely see this business based on the name + domain alone.
+You are NOT actually browsing the web; instead, you are estimating how a typical set of current large language models would likely see this business based on the name + domain alone and your general knowledge of how AI models reason about businesses.
+
+You must produce three visibility scores and insights:
+
+- discovery_score (0–100): How easily AI systems would be expected to find or recognize this business for relevant queries.
+- accuracy_score (0–100): How well AI systems would likely describe what this business actually does.
+- authority_score (0–100): How confidently AI systems would be expected to rely on this business vs. other sources when answering questions in its space.
+
+Then you must recommend a service package and short strategy based on the average of those three scores, using this logic:
+
+1. Compute:
+   average_score = (discovery_score + accuracy_score + authority_score) / 3
+
+2. If average_score >= 80:
+   recommended_package = "Basic"
+   strategy = "Your AI visibility is strong. The goal now is to maintain this visibility as models evolve. VizAI Basic provides proactive monitoring and light monthly updates."
+
+3. If 40 <= average_score < 80:
+   recommended_package = "Standard"
+   strategy = "AI understands your business partially but important gaps exist. VizAI Standard improves your visibility through structured optimization and authority reinforcement."
+
+4. If average_score < 40:
+   recommended_package = "Standard + Add-Ons"
+   strategy = "Your AI visibility is critically low. AI may not be identifying or describing your business correctly. Immediate optimization is recommended, including truth-file rebuild, schema corrections, and ecosystem seeding."
 
 Return a single JSON object with this exact structure:
 
@@ -71,12 +95,16 @@ Return a single JSON object with this exact structure:
     "<short bullet about accuracy>",
     "<short bullet about authority>",
     "<optional extra insight>"
-  ]
+  ],
+  "recommended_package": "<Basic | Standard | Standard + Add-Ons>",
+  "strategy": "<short plain-language explanation>"
 }}
 
 Rules:
 - Scores must be integers between 0 and 100.
 - findings must be a non-empty list of short, readable bullets.
+- recommended_package must follow the rules above.
+- strategy must be 1–3 sentences of practical language.
 - Do not include any surrounding text, explanation, or markdown. Return ONLY JSON.
 """.strip()
 
@@ -118,11 +146,21 @@ Rules:
             detail=f"Failed to parse LLM JSON: {str(e)} | content={content}",
         )
 
+    # Safely map JSON into our response model with defaults
+    discovery = int(parsed.get("discovery_score", 50))
+    accuracy = int(parsed.get("accuracy_score", 50))
+    authority = int(parsed.get("authority_score", 50))
+    findings = parsed.get("findings", ["No findings returned."])
+    recommended_package = parsed.get("recommended_package", "Standard")
+    strategy = parsed.get("strategy", "AI visibility requires improvement. A structured optimization program is recommended.")
+
     return ScanResponse(
-        discovery_score=int(parsed.get("discovery_score", 50)),
-        accuracy_score=int(parsed.get("accuracy_score", 50)),
-        authority_score=int(parsed.get("authority_score", 50)),
-        findings=parsed.get("findings", ["No findings returned."]),
+        discovery_score=discovery,
+        accuracy_score=accuracy,
+        authority_score=authority,
+        findings=findings,
+        recommended_package=recommended_package,
+        strategy=strategy,
     )
 
 
@@ -131,11 +169,12 @@ Rules:
 def run_scan(payload: ScanRequest):
     try:
         return run_lmo_analysis(
-          business_name=payload.businessName,
-          website=str(payload.website),
-          models=payload.models,
+            business_name=payload.businessName,
+            website=str(payload.website),
+            models=payload.models,
         )
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
