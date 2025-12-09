@@ -1,78 +1,156 @@
 import os
 import json
-import requests
-import httpx
-import asyncio
-from typing import List
+from typing import List, Optional
 
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, EmailStr
 
-# --- Config: OpenAI + Resend ---
+# -------------------------------------------------------------------
+# Config / Environment
+# -------------------------------------------------------------------
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO")
-NOTIFY_EMAIL_FROM = os.getenv("NOTIFY_EMAIL_FROM")  # optional
+NOTIFY_EMAIL_FROM = os.getenv("NOTIFY_EMAIL_FROM")  # e.g. "scan@vizai.io"
+NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO")      # e.g. "you@yourmail.com"
+
+EMAIL_NOTIFICATIONS_ENABLED = bool(
+    RESEND_API_KEY and NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO
+)
 
 if not OPENAI_API_KEY:
     print("[VizAI] WARNING: OPENAI_API_KEY is not set. /run_scan will fail.")
 
-if RESEND_API_KEY and NOTIFY_EMAIL_TO:
-    print("[VizAI] Email notifications are enabled (Resend).")
+if EMAIL_NOTIFICATIONS_ENABLED:
+    print("[VizAI] Email notifications via Resend are ENABLED.")
 else:
-    print("[VizAI] Email notifications are DISABLED (missing RESEND_API_KEY or NOTIFY_EMAIL_TO).")
+    print("[VizAI] Email notifications are DISABLED (missing env vars).")
 
-# --- FastAPI app setup ---
+# -------------------------------------------------------------------
+# FastAPI app setup
+# -------------------------------------------------------------------
 
 app = FastAPI(title="VizAI Scan API")
 
+# In production you can restrict this to your actual frontend origin
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # in prod you can restrict to https://vizai.io
+    allow_origins=[FRONTEND_ORIGIN] if FRONTEND_ORIGIN != "*" else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --- Models ---
+# -------------------------------------------------------------------
+# Models
+# -------------------------------------------------------------------
+
 
 class ScanRequest(BaseModel):
     businessName: str
     website: HttpUrl
-    models: List[str] = []  # kept for future, currently unused
+    models: List[str] = []  # kept for future use, currently informational only
+    contactEmail: Optional[EmailStr] = None  # optional user email
 
 
 class ScanResponse(BaseModel):
     discovery_score: int
     accuracy_score: int
     authority_score: int
+    overall_score: int
+    package_recommendation: str
+    package_explanation: str
+    strategy_summary: str
     findings: List[str]
 
 
-# --- Core LMO analysis using OpenAI ---
+# -------------------------------------------------------------------
+# Helper: package recommendation logic
+# -------------------------------------------------------------------
+
+
+def derive_recommendation(
+    discovery: int, accuracy: int, authority: int
+) -> ScanResponse:
+    overall = int(round((discovery + accuracy + authority) / 3))
+
+    # Default texts; refined per band below
+    package = "Standard LMO"
+    explanation = ""
+    strategy = ""
+
+    if overall >= 80:
+        package = "Basic LMO"
+        explanation = (
+            "Your AI visibility is strong. The Basic package focuses on "
+            "monitoring and light adjustments so scores stay high as models evolve."
+        )
+        strategy = (
+            "Lock in a clean Truth File, enable monthly score checks, and correct "
+            "any small drifts before they become visible to customers."
+        )
+    elif overall >= 40:
+        package = "Standard LMO"
+        explanation = (
+            "Your AI profile is partially correct but has noticeable gaps or "
+            "inconsistencies. Standard is designed to close those gaps and raise "
+            "confidence across models."
+        )
+        strategy = (
+            "Prioritize fixing core facts (who you are, what you do, where you "
+            "operate), then publish structured data and registry entries to push "
+            "scores into the 70–80 range."
+        )
+    else:
+        package = "Standard LMO + Add-Ons"
+        explanation = (
+            "AI currently has a weak or fragmented view of your business. "
+            "You’ll need a deeper correction pass plus targeted add-ons to "
+            "build a strong presence."
+        )
+        strategy = (
+            "Start with Standard LMO to establish a clean Truth File and "
+            "baseline visibility, then layer add-ons such as Schema Deployment, "
+            "Competitor Deep Dive, and Dataset Creation to quickly improve how "
+            "models discover and describe you."
+        )
+
+    return overall, package, explanation, strategy
+
+
+# -------------------------------------------------------------------
+# Helper: call OpenAI for LMO-style analysis
+# -------------------------------------------------------------------
+
 
 def run_lmo_analysis(business_name: str, website: str, models: List[str]) -> ScanResponse:
     if not OPENAI_API_KEY:
-        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured on the server.")
+        raise HTTPException(
+            status_code=500, detail="OPENAI_API_KEY is not configured on the server."
+        )
 
-    models_str = ", ".join(models) if models else "not specified"
+    models_str = ", ".join(models) if models else "ChatGPT (default)"
 
     prompt = f"""
 You are an expert in Language Model Optimization (LMO).
 
-A business has requested an LMO-style scan.
+A business has requested an AI visibility scan.
 
 Business name: {business_name}
 Website: {website}
-Models selected: {models_str}
+Models selected (informational only): {models_str}
 
-You are NOT actually browsing the web; instead, you are estimating how a typical set of current LLMs would likely see this business based on the name + domain alone.
+You are NOT actually browsing the web. Instead, estimate how a typical set of
+current large language models would likely see this business based on the name
+and domain alone.
 
-Return a single JSON object with this exact structure:
+Return a single JSON object with EXACTLY this structure (keys and types):
 
 {{
   "discovery_score": <integer 0-100>,
@@ -86,10 +164,14 @@ Return a single JSON object with this exact structure:
   ]
 }}
 
-Rules:
-- Scores must be integers between 0 and 100.
-- findings must be a non-empty list of short, readable bullets.
-- Do not include any surrounding text, explanation, or markdown. Return ONLY JSON.
+Guidelines:
+- discovery_score: how likely models are to find / recognize the business.
+- accuracy_score: how correctly they describe services, locations, and value.
+- authority_score: how likely models are to rely on this business vs generic
+  directories or competitors.
+- Scores MUST be integers between 0 and 100.
+- findings MUST be a non-empty list of short, readable bullets.
+- Do NOT include any explanation outside the JSON. ONLY return JSON.
 """.strip()
 
     headers = {
@@ -130,142 +212,169 @@ Rules:
             detail=f"Failed to parse LLM JSON: {str(e)} | content={content}",
         )
 
+    discovery = int(parsed.get("discovery_score", 50))
+    accuracy = int(parsed.get("accuracy_score", 50))
+    authority = int(parsed.get("authority_score", 50))
+    findings = parsed.get("findings", ["No findings returned."])
+
+    overall, package, explanation, strategy = derive_recommendation(
+        discovery, accuracy, authority
+    )
+
     return ScanResponse(
-        discovery_score=int(parsed.get("discovery_score", 50)),
-        accuracy_score=int(parsed.get("accuracy_score", 50)),
-        authority_score=int(parsed.get("authority_score", 50)),
-        findings=parsed.get("findings", ["No findings returned."]),
+        discovery_score=discovery,
+        accuracy_score=accuracy,
+        authority_score=authority,
+        overall_score=overall,
+        package_recommendation=package,
+        package_explanation=explanation,
+        strategy_summary=strategy,
+        findings=findings,
     )
 
 
-# --- Package recommendation logic for notifications ---
-
-def recommend_package(avg_score: int) -> str:
-    if avg_score >= 80:
-        return "Basic"
-    if avg_score >= 40:
-        return "Standard"
-    return "Standard + Add-Ons"
+# -------------------------------------------------------------------
+# Helper: send notification via Resend
+# -------------------------------------------------------------------
 
 
-# --- Resend email helper ---
+def send_notification(request: ScanRequest, result: ScanResponse) -> bool:
+    if not EMAIL_NOTIFICATIONS_ENABLED:
+        print("[VizAI] Notifications not configured; skipping email.")
+        return False
 
-def send_notification_email(
-    business_name: str,
-    website: str,
-    scores: ScanResponse,
-) -> None:
-    """Send scan summary to your inbox via Resend."""
-    if not (RESEND_API_KEY and NOTIFY_EMAIL_TO):
-        print("[VizAI] Skipping notification email (missing RESEND_API_KEY or NOTIFY_EMAIL_TO).")
-        return
+    subject = f"[VizAI Scan] {request.businessName} ({result.overall_score}/100)"
 
-    avg_score = (scores.discovery_score + scores.accuracy_score + scores.authority_score) // 3
-    recommended_tier = recommend_package(avg_score)
+    models_str = ", ".join(request.models) if request.models else "ChatGPT (default)"
 
-    subject = f"[VizAI Scan] {business_name} – Avg {avg_score}"
+    findings_block = "\n".join(f"- {line}" for line in result.findings)
 
-    html_body = f"""
-    <h2>New VizAI Scan Result</h2>
-    <p><strong>Business:</strong> {business_name}</p>
-    <p><strong>Website:</strong> {website}</p>
-    <p><strong>Scores:</strong></p>
-    <ul>
-      <li>Discovery: {scores.discovery_score}</li>
-      <li>Accuracy: {scores.accuracy_score}</li>
-      <li>Authority: {scores.authority_score}</li>
-    </ul>
-    <p><strong>Average score:</strong> {avg_score}</p>
-    <p><strong>Suggested package:</strong> {recommended_tier}</p>
-    <p><strong>Findings:</strong></p>
-    <ul>
-      {''.join(f'<li>{f}</li>' for f in scores.findings)}
-    </ul>
-    <hr/>
-    <p>This notification was sent automatically by VizAI Scan.</p>
-    """
+    body = f"""
+New VizAI scan submitted.
 
-    from_address = NOTIFY_EMAIL_FROM or "VizAI Scan <onboarding@resend.dev>"
+Business: {request.businessName}
+Website: {request.website}
+Models (informational): {models_str}
+Contact Email: {request.contactEmail or "n/a"}
+
+Scores
+- Discovery: {result.discovery_score}
+- Accuracy: {result.accuracy_score}
+- Authority: {result.authority_score}
+- Overall: {result.overall_score}
+
+Recommended Package: {result.package_recommendation}
+Explanation: {result.package_explanation}
+
+Strategy Summary:
+{result.strategy_summary}
+
+Findings:
+{findings_block}
+""".strip()
 
     headers = {
         "Authorization": f"Bearer {RESEND_API_KEY}",
         "Content-Type": "application/json",
     }
-    payload = {
-        "from": from_address,
+
+    data = {
+        "from": NOTIFY_EMAIL_FROM,
         "to": [NOTIFY_EMAIL_TO],
         "subject": subject,
-        "html": html_body,
+        "text": body,
     }
 
     try:
         resp = requests.post(
-            "https://api.resend.com/emails",
-            headers=headers,
-            json=payload,
-            timeout=15,
+            "https://api.resend.com/emails", headers=headers, json=data, timeout=20
         )
-        resp.raise_for_status()
-        print("[VizAI] Notification email sent via Resend.")
     except Exception as e:
-        print(f"[VizAI] Failed to send notification email via Resend: {e}")
+        print(f"[VizAI] Error calling Resend: {e}")
+        return False
+
+    if 200 <= resp.status_code < 300:
+        print("[VizAI] Notification email sent via Resend.")
+        return True
+
+    print(
+        f"[VizAI] Failed to send email via Resend: "
+        f"{resp.status_code} {resp.text}"
+    )
+    return False
 
 
-# --- API endpoints ---
+# -------------------------------------------------------------------
+# Routes
+# -------------------------------------------------------------------
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "VizAI Scan API"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "healthy"}
+
 
 @app.post("/run_scan", response_model=ScanResponse)
 def run_scan(payload: ScanRequest):
-    try:
-        result = run_lmo_analysis(
-            business_name=payload.businessName,
-            website=str(payload.website),
-            models=payload.models,
-        )
-
-        # fire-and-forget notification
-        try:
-            send_notification_email(
-                business_name=payload.businessName,
-                website=str(payload.website),
-                scores=result,
-            )
-        except Exception as e:
-            # don't break the scan if email fails
-            print(f"[VizAI] Error during notification send (non-fatal): {e}")
-
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-
-
-@app.get("/test_email")
-def test_email():
-    """Manual test endpoint to confirm Resend + env vars work."""
-    dummy_scores = ScanResponse(
-        discovery_score=72,
-        accuracy_score=68,
-        authority_score=61,
-        findings=[
-            "Test run only – no real scan performed.",
-            "This verifies that Resend + notification pipeline works.",
-        ],
+    """
+    Main endpoint used by the VizAI frontend.
+    """
+    result = run_lmo_analysis(
+        business_name=payload.businessName,
+        website=str(payload.website),
+        models=payload.models,
     )
 
+    # Fire-and-forget style notification (errors are logged, not surfaced to user)
     try:
-        send_notification_email(
-            business_name="VizAI Test Business",
-            website="https://vizai.io",
-            scores=dummy_scores,
-        )
-        return {"status": "notification_attempted"}
+        sent = send_notification(payload, result)
+        if sent:
+            print("[VizAI] Scan notification attempted: success.")
+        else:
+            print("[VizAI] Scan notification attempted: not sent.")
     except Exception as e:
-        # Don't expose internals, just log them
-        print(f"[VizAI] /test_email error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to attempt notification.")
+        print(f"[VizAI] Exception while sending notification: {e}")
 
+    return result
+
+
+@app.post("/test_email")
+def test_email():
+    """
+    Simple endpoint to confirm email notifications are wired correctly.
+    Uses dummy scores and business info.
+    """
+    if not EMAIL_NOTIFICATIONS_ENABLED:
+        return {"status": "notifications_not_configured"}
+
+    dummy_request = ScanRequest(
+        businessName="Test Business",
+        website="https://example.com",
+        models=["chatgpt"],
+        contactEmail="test@example.com",
+    )
+
+    dummy_result = ScanResponse(
+        discovery_score=70,
+        accuracy_score=65,
+        authority_score=60,
+        overall_score=65,
+        package_recommendation="Standard LMO",
+        package_explanation="Test email – standard tier.",
+        strategy_summary="This is a test email from VizAI backend.",
+        findings=["This is a test finding from /test_email."],
+    )
+
+    sent = send_notification(dummy_request, dummy_result)
+
+    return {
+        "status": "notification_attempted" if sent else "notification_failed",
+    }
 
 
 
