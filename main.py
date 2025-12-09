@@ -1,36 +1,50 @@
 import os
 import json
+import smtplib
 import requests
 from typing import List
+from email.mime.text import MIMEText
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
-# --- Config ---
+# --- Config: OpenAI ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # adjust if you prefer a different model
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 if not OPENAI_API_KEY:
     print("WARNING: OPENAI_API_KEY is not set. The /run_scan endpoint will fail until it is configured.")
 
+# --- Config: Email notifications ---
+SMTP_HOST = os.getenv("SMTP_HOST")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+NOTIFY_EMAIL_FROM = os.getenv("NOTIFY_EMAIL_FROM")
+NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO")
+
+if not NOTIFY_EMAIL_TO:
+    print("INFO: NOTIFY_EMAIL_TO is not set. Scan notifications will be disabled.")
+
+
 # --- FastAPI app setup ---
 app = FastAPI(title="VizAI Scan API")
 
-# CORS: in production, you can restrict to your Vercel / HF Space URL
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # e.g. ["https://www.vizai.io"]
+    allow_origins=["*"],  # you can lock this down to your vizai.io domain later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # --- Request/Response models ---
 class ScanRequest(BaseModel):
     businessName: str
     website: HttpUrl
-    models: List[str] = []  # currently unused, but kept for future extension
+    models: List[str] = []  # kept for future use, not required by frontend
 
 
 class ScanResponse(BaseModel):
@@ -42,6 +56,65 @@ class ScanResponse(BaseModel):
     strategy: str
 
 
+# --- Helper: send notification email ---
+def send_scan_notification(req: ScanRequest, res: ScanResponse) -> None:
+    """Send an email with scan input + results. Fail silently if misconfigured."""
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD and NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO):
+        # Notifications not configured; do nothing
+        return
+
+    try:
+        avg_score = int(
+            (res.discovery_score + res.accuracy_score + res.authority_score) / 3
+        )
+
+        subject = f"[VizAI] New Scan — {req.businessName} ({avg_score}/100)"
+
+        body_lines = [
+            "A new VizAI Scan has been run.",
+            "",
+            "=== Input ===",
+            f"Business Name: {req.businessName}",
+            f"Website:      {req.website}",
+            f"Models:       {', '.join(req.models) if req.models else 'not specified'}",
+            "",
+            "=== Scores ===",
+            f"Discovery: {res.discovery_score}",
+            f"Accuracy:  {res.accuracy_score}",
+            f"Authority: {res.authority_score}",
+            f"Average:   {avg_score}",
+            "",
+            "=== Recommended Package ===",
+            f"{res.recommended_package}",
+            "",
+            "=== Strategy ===",
+            res.strategy,
+            "",
+            "=== Findings ===",
+        ]
+
+        for f in res.findings:
+            body_lines.append(f"- {f}")
+
+        body = "\n".join(body_lines)
+
+        msg = MIMEText(body)
+        msg["Subject"] = subject
+        msg["From"] = NOTIFY_EMAIL_FROM
+        msg["To"] = NOTIFY_EMAIL_TO
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.send_message(msg)
+
+        print(f"[VizAI] Notification email sent for {req.businessName}")
+
+    except Exception as e:
+        # Don't break the scan if email fails; just log
+        print(f"[VizAI] Failed to send notification email: {e}")
+
+
 # --- Helper: call OpenAI for LMO-style analysis ---
 def run_lmo_analysis(business_name: str, website: str, models: List[str]) -> ScanResponse:
     if not OPENAI_API_KEY:
@@ -49,7 +122,6 @@ def run_lmo_analysis(business_name: str, website: str, models: List[str]) -> Sca
 
     models_str = ", ".join(models) if models else "not specified"
 
-    # Core prompt for VizAI / LMO-style scan
     prompt = f"""
 You are an expert in Language Model Optimization (LMO) and AI visibility diagnostics.
 
@@ -146,7 +218,6 @@ Rules:
             detail=f"Failed to parse LLM JSON: {str(e)} | content={content}",
         )
 
-    # Safely map JSON into our response model with defaults
     discovery = int(parsed.get("discovery_score", 50))
     accuracy = int(parsed.get("accuracy_score", 50))
     authority = int(parsed.get("authority_score", 50))
@@ -168,13 +239,19 @@ Rules:
 @app.post("/run_scan", response_model=ScanResponse)
 def run_scan(payload: ScanRequest):
     try:
-        return run_lmo_analysis(
+        result = run_lmo_analysis(
             business_name=payload.businessName,
             website=str(payload.website),
             models=payload.models,
         )
+
+        # Fire-and-forget notification
+        send_scan_notification(payload, result)
+
+        return result
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
 
