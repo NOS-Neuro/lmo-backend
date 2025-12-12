@@ -1,10 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.0
 requests==2.32.3
-
-# EmailStr support (installs email-validator + dependencies)
-pydantic[email]==2.9.2
-
-# Postgres (only needed if you're actually writing scan results to Postgres)
-psycopg2-binary==2.9.9
+pydantic[email]
+email-validator>=2.0.0
+psycopg2-binary
 
