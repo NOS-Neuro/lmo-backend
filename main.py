@@ -655,10 +655,33 @@ def run_scan(payload: ScanRequest, request: Request):
 
     logger.info("Scan started: business=%s ip=%s", payload.businessName, client_ip)
 
-    result, raw_llm = run_lmo_analysis(
-        business_name=payload.businessName,
-        website=str(payload.website),
-        models=payload.models,
+    from scan_engine_real import run_real_scan_perplexity
+
+real_result, raw_bundle = run_real_scan_perplexity(
+    business_name=payload.businessName,
+    website=str(payload.website),
+)
+
+# Map to your existing ScanResponse
+overall, package, explanation, strategy = derive_recommendation(
+    real_result.discovery_score,
+    real_result.accuracy_score,
+    real_result.authority_score
+)
+
+result = ScanResponse(
+    discovery_score=real_result.discovery_score,
+    accuracy_score=real_result.accuracy_score,
+    authority_score=real_result.authority_score,
+    overall_score=real_result.overall_score,
+    package_recommendation=real_result.package_recommendation,
+    package_explanation=real_result.package_explanation,
+    strategy_summary=real_result.strategy_summary,
+    findings=real_result.findings,
+)
+
+raw_llm = raw_bundle
+
     )
 
     scan_id = uuid.uuid4()
