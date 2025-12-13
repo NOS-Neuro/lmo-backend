@@ -392,10 +392,12 @@ def run_real_scan_perplexity(
     findings.append(f"Official site cited: {'yes' if cites_official else 'no'}")
     findings.append(f"Unique citation domains: {len(uniq_domains)}")
     if freshest_days is not None:
-        findings.append(f"Freshest cited source: ~{freshest_days} days old")
+    findings.append(f"Freshest cited source: ~{freshest_days} days old")
     else:
-        findings.append("Freshness: citation dates not provided by sources")
+    findings.append("Freshness: citation dates not provided by sources")
     findings.append(f"Comprehensiveness signals: {comprehensiveness_hits}/3 (services/location/contact)")
+    findings.append("Score ceiling: categories max 95; overall max 92 (prevents perfect-score inflation).")
+
     
     metrics = {
         "engine": raw_bundle["engine"],
