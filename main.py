@@ -2,7 +2,7 @@ import os
 import uuid
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -80,6 +80,11 @@ class CompetitorIn(BaseModel):
         return v
 
 
+class QuestionIn(BaseModel):
+    prompt_name: str
+    question: str
+
+
 class ScanRequest(BaseModel):
     businessName: str
     website: HttpUrl
@@ -87,6 +92,7 @@ class ScanRequest(BaseModel):
     requestContact: bool = False
     models: List[str] = []
     competitors: List[CompetitorIn] = []
+    questions: List[QuestionIn] = []
 
     @field_validator("businessName")
     @classmethod
@@ -157,7 +163,6 @@ def return_db_conn(conn) -> None:
         except Exception as e:
             logger.exception("Failed to return DB connection to pool: %s", e)
 
-
 # -------------------------------------------------------------------
 # DB Schema
 # -------------------------------------------------------------------
@@ -227,7 +232,6 @@ def ensure_tables_and_migrations() -> None:
         logger.exception("Failed ensuring tables/migrations: %s", e)
     finally:
         return_db_conn(conn)
-
 
 # -------------------------------------------------------------------
 # DB Inserts
@@ -345,7 +349,6 @@ def insert_competitor_scan(
     finally:
         return_db_conn(conn)
 
-
 # -------------------------------------------------------------------
 # Startup
 # -------------------------------------------------------------------
@@ -357,7 +360,6 @@ def startup() -> None:
         init_db_pool()
         ensure_tables_and_migrations()
     logger.info("VizAI API started")
-
 
 # -------------------------------------------------------------------
 # Routes
@@ -432,12 +434,13 @@ def run_scan(payload: ScanRequest, request: Request):
     user_agent = request.headers.get("user-agent")
 
     logger.info(
-        "Scan start: biz=%s db_url_present=%s ip=%s ua_present=%s competitors=%s",
+        "Scan start: biz=%s db_url_present=%s ip=%s ua_present=%s competitors=%s questions=%s",
         payload.businessName,
         bool(DATABASE_URL),
         client_ip,
         bool(user_agent),
         len(payload.competitors),
+        len(payload.questions),
     )
 
     from scan_engine_real import run_real_scan_perplexity
@@ -447,12 +450,19 @@ def run_scan(payload: ScanRequest, request: Request):
 
     raw_llm: Optional[Dict[str, Any]] = None
 
-    # Main scan (real scan)
+    # --- Main scan
     try:
+        custom_questions: Optional[List[Tuple[str, str]]] = None
+        if payload.questions:
+            custom_questions = [(q.prompt_name, q.question) for q in payload.questions]
+
         result_obj, raw_bundle = run_real_scan_perplexity(
             business_name=payload.businessName,
             website=str(payload.website),
+            questions=custom_questions,
+            competitors=[{"name": c.name, "website": str(c.website)} for c in (payload.competitors or [])],
         )
+
         raw_llm = raw_bundle
 
         result = ScanResponse(
@@ -468,12 +478,11 @@ def run_scan(payload: ScanRequest, request: Request):
             findings=list(result_obj.findings or []),
             email_sent=False,
         )
-
     except Exception as e:
         logger.exception("Real scan failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Store main scan (fail loud if DB configured)
+    # --- Store main scan (fail loud if DB configured)
     if DATABASE_URL:
         try:
             insert_main_scan(
@@ -489,7 +498,7 @@ def run_scan(payload: ScanRequest, request: Request):
             logger.exception("DB insert failed: %s", e)
             raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
 
-        # Competitor scans (best-effort; never break main scan)
+        # --- Competitor baseline scans (best-effort; never break main scan)
         for c in (payload.competitors or []):
             try:
                 comp_obj, comp_bundle = run_real_scan_perplexity(
@@ -583,6 +592,7 @@ def get_scan_competitors(scan_id: str):
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+l})
 
 
 
