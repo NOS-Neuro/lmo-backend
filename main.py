@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl, EmailStr, field_validator
 
+import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import Json
 
@@ -31,6 +32,7 @@ logger = logging.getLogger("vizai")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+# Perplexity env vars are used inside scan_engine_real.py, but we log readiness here
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
@@ -53,7 +55,7 @@ logger.info("OpenAI fallback scan: %s", "READY" if OPENAI_API_KEY else "NOT CONF
 
 app = FastAPI(
     title="VizAI Scan API",
-    version="1.4.1",
+    version="1.4.0",
     description="VizAI: real scan (Perplexity web-backed) with honest fallback (OpenAI estimation).",
 )
 
@@ -69,12 +71,30 @@ app.add_middleware(
 # Models
 # -------------------------------------------------------------------
 
+class CompetitorIn(BaseModel):
+    name: str
+    website: HttpUrl
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        v = (v or "").strip()
+        if len(v) < 2:
+            raise ValueError("Competitor name too short")
+        if len(v) > 200:
+            raise ValueError("Competitor name too long")
+        return v
+
+
 class ScanRequest(BaseModel):
     businessName: str
     website: HttpUrl
     contactEmail: EmailStr
     requestContact: bool = False
     models: List[str] = []  # backwards compatibility
+
+    # NEW: optional competitor baseline scans
+    competitors: List[CompetitorIn] = []
 
     @field_validator("businessName")
     @classmethod
@@ -89,6 +109,7 @@ class ScanRequest(BaseModel):
     @field_validator("website")
     @classmethod
     def validate_website(cls, v: HttpUrl) -> HttpUrl:
+        # Basic SSRF reduction: block localhost + common private ranges (best-effort)
         url_str = str(v).lower()
         blocked = ["localhost", "127.0.0.1", "0.0.0.0", "::1"]
         if any(b in url_str for b in blocked):
@@ -159,7 +180,7 @@ def ensure_tables_and_migrations() -> None:
     if not DATABASE_URL:
         return
 
-    ddl_create = """
+    ddl_create_scans = """
     CREATE TABLE IF NOT EXISTS vizai_scans (
       scan_id UUID PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL,
@@ -181,18 +202,42 @@ def ensure_tables_and_migrations() -> None:
       raw_llm JSONB,
 
       ip_address TEXT,
-      user_agent TEXT
+      user_agent TEXT,
+
+      email_sent BOOLEAN DEFAULT FALSE
     );
     """
 
-    ddl_migrate = """
-    ALTER TABLE vizai_scans
-      ADD COLUMN IF NOT EXISTS email_sent BOOLEAN DEFAULT FALSE;
-
+    ddl_create_indexes = """
     CREATE INDEX IF NOT EXISTS idx_vizai_scans_created_at ON vizai_scans(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_vizai_scans_contact_email ON vizai_scans(contact_email);
     CREATE INDEX IF NOT EXISTS idx_vizai_scans_business_name ON vizai_scans(business_name);
     CREATE INDEX IF NOT EXISTS idx_vizai_scans_overall_score ON vizai_scans(overall_score);
+    """
+
+    # NEW: competitor baseline table
+    ddl_create_competitors = """
+    CREATE TABLE IF NOT EXISTS vizai_competitor_scans (
+      id BIGSERIAL PRIMARY KEY,
+      parent_scan_id UUID NOT NULL REFERENCES vizai_scans(scan_id) ON DELETE CASCADE,
+      created_at TIMESTAMPTZ NOT NULL,
+
+      competitor_name TEXT NOT NULL,
+      competitor_website TEXT NOT NULL,
+
+      discovery_score INT NOT NULL,
+      accuracy_score INT NOT NULL,
+      authority_score INT NOT NULL,
+      overall_score INT NOT NULL,
+
+      raw_bundle JSONB
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_vizai_comp_parent_scan_id
+      ON vizai_competitor_scans(parent_scan_id);
+
+    CREATE INDEX IF NOT EXISTS idx_vizai_comp_overall
+      ON vizai_competitor_scans(overall_score);
     """
 
     conn = None
@@ -203,8 +248,9 @@ def ensure_tables_and_migrations() -> None:
             return
         conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute(ddl_create)
-            cur.execute(ddl_migrate)
+            cur.execute(ddl_create_scans)
+            cur.execute(ddl_create_indexes)
+            cur.execute(ddl_create_competitors)
         logger.info("DB ensured + migrations applied")
     except Exception as e:
         logger.exception("Failed ensuring tables/migrations: %s", e)
@@ -279,6 +325,59 @@ def insert_scan(
         return True
     except Exception as e:
         logger.exception("Failed inserting scan into DB: %s", e)
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        return_db_conn(conn)
+
+def insert_competitor_scan(
+    *,
+    parent_scan_id: uuid.UUID,
+    created_at: datetime,
+    competitor_name: str,
+    competitor_website: str,
+    scores: Dict[str, int],
+    raw_bundle: Optional[Dict[str, Any]],
+) -> bool:
+    if not DATABASE_URL:
+        return False
+
+    sql = """
+    INSERT INTO vizai_competitor_scans (
+      parent_scan_id, created_at,
+      competitor_name, competitor_website,
+      discovery_score, accuracy_score, authority_score, overall_score,
+      raw_bundle
+    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s);
+    """
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        if not conn:
+            return False
+        with conn.cursor() as cur:
+            cur.execute(
+                sql,
+                (
+                    str(parent_scan_id),
+                    created_at,
+                    competitor_name,
+                    competitor_website,
+                    int(scores.get("discovery", 0)),
+                    int(scores.get("accuracy", 0)),
+                    int(scores.get("authority", 0)),
+                    int(scores.get("overall", 0)),
+                    Json(raw_bundle) if raw_bundle is not None else None,
+                ),
+            )
+        conn.commit()
+        return True
+    except Exception:
         try:
             if conn:
                 conn.rollback()
@@ -427,10 +526,12 @@ Return ONLY JSON.
         package_explanation=explanation,
         strategy_summary=strategy,
         findings=findings,
-        disclaimer=(
-            "Fallback mode: this scan is an AI-assisted estimate based on your business name and domain only. "
-            "It did not browse the web or capture citations."
-        ),
+    )
+
+    # Make the fallback disclaimer explicit
+    result.disclaimer = (
+        "Fallback mode: this scan is an AI-assisted estimate based on your business name and domain only. "
+        "It did not browse the web or capture citations."
     )
 
     return result, parsed
@@ -525,7 +626,10 @@ def format_operator_report(req: ScanRequest, raw_bundle: Dict[str, Any], scan_id
     scores = raw_bundle.get("scores", {}) or {}
     metrics = raw_bundle.get("metrics", {}) or {}
 
-    recs = raw_bundle.get("recommendations") or (metrics.get("recommendations") if isinstance(metrics, dict) else None) or {}
+    # recommendations may be stored at raw_bundle["recommendations"] or in metrics["recommendations"]
+    recs = raw_bundle.get("recommendations")
+    if not recs:
+        recs = (metrics.get("recommendations") if isinstance(metrics, dict) else None) or {}
 
     runs = raw_bundle.get("runs", []) or []
     uniq_domains = metrics.get("unique_citation_domains") or []
@@ -538,7 +642,7 @@ def format_operator_report(req: ScanRequest, raw_bundle: Dict[str, Any], scan_id
         out: List[str] = []
         for r in items[:10]:
             title = r.get("title", "(untitled)")
-            priority = r.get("priority", "P2")
+            priority = r.get("priority", "medium")
             out.append(f"- {title} [{priority}]")
             steps = r.get("action_steps") or []
             for s in steps[:6]:
@@ -562,6 +666,28 @@ def format_operator_report(req: ScanRequest, raw_bundle: Dict[str, Any], scan_id
         run_lines.append(f"- {pn}: {len(c)} citations")
 
     domains_preview = ", ".join(uniq_domains[:12]) + (" ..." if len(uniq_domains) > 12 else "")
+
+    # competitor baseline summary
+    comp = raw_bundle.get("competitor_baseline") if isinstance(raw_bundle, dict) else None
+    comp_section = ""
+    if comp:
+        comp_items = comp.get("items") or []
+        comp_summary = comp.get("summary") or {}
+        lines = []
+        lines.append(f"Requested: {comp.get('requested', 0)} | Completed: {comp.get('completed', 0)} | Failed: {comp.get('failed', 0)}")
+        if comp_summary:
+            lines.append(f"Your overall: {comp_summary.get('your_overall')}")
+            lines.append(f"Rank vs competitors: {comp_summary.get('rank_vs_competitors')}")
+            lines.append(f"Percentile estimate: {comp_summary.get('percentile_estimate')}%")
+            lines.append(f"Competitor overalls: {comp_summary.get('competitor_overalls')}")
+        if comp_items:
+            lines.append("")
+            lines.append("Competitors (name → overall):")
+            for it in comp_items[:10]:
+                nm = it.get("name")
+                ov = (it.get("scores") or {}).get("overall")
+                lines.append(f"- {nm} → {ov}")
+        comp_section = "\n".join(lines).strip()
 
     return f"""
 VIZAI OPERATOR REPORT (PRIVATE)
@@ -605,6 +731,10 @@ NEXT SCAN FOCUS
 RUNS / CITATIONS
 --------------------------------------------------
 {chr(10).join(run_lines) if run_lines else "- (none)"}
+
+COMPETITOR BASELINE (PRIVATE)
+--------------------------------------------------
+{comp_section if comp_section else "- (none)"}
 """.strip()
 
 def send_operator_report(req: ScanRequest, raw_bundle: Dict[str, Any], scan_id: str) -> bool:
@@ -647,7 +777,7 @@ def root():
     return {
         "status": "ok",
         "service": "VizAI Scan API",
-        "version": "1.4.1",
+        "version": "1.4.0",
         "endpoints": {
             "scan": "/run_scan",
             "health": "/health",
@@ -687,6 +817,14 @@ def health():
 
 @app.post("/run_scan", response_model=ScanResponse)
 def run_scan(payload: ScanRequest, request: Request):
+    """
+    Main endpoint used by the VizAI frontend:
+    - Real scan (Perplexity web-backed) by default
+    - Honest fallback (OpenAI estimation) if Real scan fails
+    - Stores raw evidence bundle in Postgres (best-effort)
+    - Emails: admin notification + user report + operator report (best-effort)
+    - Optional competitor baseline scans (best-effort)
+    """
     # request metadata
     client_ip = None
     try:
@@ -724,15 +862,18 @@ def run_scan(payload: ScanRequest, request: Request):
             package_explanation=str(real_result.package_explanation),
             strategy_summary=str(real_result.strategy_summary),
             findings=list(real_result.findings or []),
-            disclaimer=(
-                "Real Scan mode: this report is based on web-backed answers and captured citations "
-                "(stored for audit and comparison)."
-            ),
+        )
+
+        # Set a clear disclaimer for real scan mode
+        result.disclaimer = (
+            "Real Scan mode: this report is based on web-backed answers and captured citations "
+            "(stored for audit and comparison)."
         )
 
         raw_llm = raw_bundle
 
     except Exception as e:
+        # Fallback to honest OpenAI estimate (if configured)
         logger.exception("Real scan failed; falling back to OpenAI estimate: %s", e)
         result, parsed = run_openai_estimate(
             business_name=payload.businessName,
@@ -749,6 +890,76 @@ def run_scan(payload: ScanRequest, request: Request):
     # attach metadata
     result.scan_id = str(scan_id)
     result.created_at = created_at.isoformat()
+
+    # ------------------------------------------------------------
+    # Competitor baseline scans (best-effort, optional)
+    # ------------------------------------------------------------
+    competitor_baseline = {
+        "requested": len(payload.competitors or []),
+        "completed": 0,
+        "failed": 0,
+        "items": [],
+        "summary": None,
+    }
+
+    try:
+        comps = payload.competitors or []
+        if comps:
+            from scan_engine_real import run_real_scan_perplexity
+
+            for c in comps[:5]:  # safety cap
+                try:
+                    comp_res, comp_bundle = run_real_scan_perplexity(
+                        business_name=c.name,
+                        website=str(c.website),
+                    )
+
+                    item = {
+                        "name": c.name,
+                        "website": str(c.website),
+                        "scores": {
+                            "discovery": int(comp_res.discovery_score),
+                            "accuracy": int(comp_res.accuracy_score),
+                            "authority": int(comp_res.authority_score),
+                            "overall": int(comp_res.overall_score),
+                        },
+                    }
+                    competitor_baseline["items"].append(item)
+                    competitor_baseline["completed"] += 1
+
+                    if DATABASE_URL:
+                        insert_competitor_scan(
+                            parent_scan_id=scan_id,
+                            created_at=created_at,
+                            competitor_name=c.name,
+                            competitor_website=str(c.website),
+                            scores=item["scores"],
+                            raw_bundle=comp_bundle,
+                        )
+
+                except Exception:
+                    competitor_baseline["failed"] += 1
+
+            all_overalls = [i["scores"]["overall"] for i in competitor_baseline["items"]]
+            all_overalls_sorted = sorted(all_overalls, reverse=True)
+
+            my_overall = int(result.overall_score)
+            if all_overalls_sorted:
+                rank = 1 + sum(1 for x in all_overalls_sorted if x > my_overall)
+                total = len(all_overalls_sorted) + 1  # include "you"
+                percentile = round((1 - ((rank - 1) / total)) * 100)
+                competitor_baseline["summary"] = {
+                    "your_overall": my_overall,
+                    "rank_vs_competitors": f"{rank}/{total}",
+                    "percentile_estimate": percentile,
+                    "competitor_overalls": all_overalls_sorted,
+                }
+
+    except Exception:
+        pass
+
+    if isinstance(raw_llm, dict):
+        raw_llm["competitor_baseline"] = competitor_baseline
 
     # Emails (best-effort)
     email_sent = False
@@ -934,9 +1145,10 @@ def test_email():
     dummy_req = ScanRequest(
         businessName="Test Business",
         website="https://example.com",
-        contactEmail=NOTIFY_EMAIL_TO,
+        contactEmail=NOTIFY_EMAIL_TO,  # send to admin for test
         requestContact=True,
         models=["default"],
+        competitors=[],
     )
 
     dummy_res = ScanResponse(
@@ -950,11 +1162,11 @@ def test_email():
         package_explanation="Test email – standard tier.",
         strategy_summary="This is a test email from VizAI backend.",
         findings=["This is a test finding from /test_email."],
-        disclaimer="Test email only.",
     )
 
     admin_sent = send_admin_notification(dummy_req, dummy_res, dummy_res.scan_id)
     user_sent = send_user_report(dummy_req, dummy_res)
+
     operator_sent = resend_send_email(
         to_email=NOTIFY_EMAIL_TO,
         subject="[VizAI OPERATOR] Test Operator Report",
@@ -990,6 +1202,7 @@ async def general_exception_handler(request: Request, exc: Exception):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
