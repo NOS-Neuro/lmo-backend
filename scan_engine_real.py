@@ -318,7 +318,222 @@ def run_real_scan_perplexity(
 
     system = (
         "You are an audit assistant using web search. "
-        "Do not guess. If in
+        "Do not guess. If information is missing, say 'unclear'. "
+        "Prefer citing the official website when available."
+    )
+
+    for prompt_name, q in qs:
+        user = (
+            f"Company name: {business_name}\n"
+            f"Official website (given): {website}\n\n"
+            f"Task: {q}\n\n"
+            f"Rules:\n"
+            f"- Only state facts supported by citations.\n"
+            f"- If uncertain, say 'unclear'.\n"
+            f"- Keep output concise.\n"
+        )
+
+        answer, hits, raw = client.chat_web(system=system, user=user, max_tokens=650)
+
+        provider_results.append(
+            ProviderResult(
+                provider="perplexity",
+                model=PERPLEXITY_MODEL,
+                prompt_name=prompt_name,
+                question=q,
+                answer_text=answer,
+                citations=hits,
+            )
+        )
+
+        raw_bundle["runs"].append(
+            {
+                "prompt_name": prompt_name,
+                "question": q,
+                "answer_text": answer,
+                "search_results": [h.__dict__ for h in hits],
+                "raw": raw,
+            }
+        )
+
+    # -----------------------------
+    # Aggregate evidence
+    # -----------------------------
+    all_text = "\n".join(r.answer_text for r in provider_results)
+
+    all_hits: List[PerplexityHit] = []
+    for r in provider_results:
+        all_hits.extend(r.citations)
+
+    cite_domains = [_domain(h.url) for h in all_hits if h.url]
+    uniq_domains = _unique([d for d in cite_domains if d])
+
+    mentions_name = _contains_name(all_text, business_name)
+    mentions_domain = bool(biz_domain and biz_domain in _norm(all_text))
+    cites_official = bool(biz_domain and any(d == biz_domain for d in cite_domains))
+    official_cite_count = int(sum(1 for d in cite_domains if d == biz_domain)) if biz_domain else 0
+
+    parsed_dates = [_parse_date(h.date) for h in all_hits]
+    parsed_dates = [d for d in parsed_dates if d is not None]
+    freshest_days = None
+    if parsed_dates:
+        newest = max(parsed_dates)
+        now = datetime.now(timezone.utc)
+        if newest.tzinfo is None:
+            newest = newest.replace(tzinfo=timezone.utc)
+        freshest_days = max(0, int((now - newest).total_seconds() // 86400))
+
+    t = _norm(all_text)
+    has_services = any(k in t for k in ["services", "solutions", "we provide", "offerings"])
+    has_location = any(k in t for k in ["located", "based in", "headquartered", "operations", "serve"])
+    has_contact = any(k in t for k in ["contact", "email", "phone", "reach", "sales"])
+    comprehensiveness_hits = sum([has_services, has_location, has_contact])  # 0..3
+
+    # -----------------------------
+    # Deterministic scoring (FIXED)
+    # -----------------------------
+
+    diversity_pts = _score_diversity(len(uniq_domains))
+    volume_pts = _score_volume(len(all_hits))
+    freshness_pts = _score_freshness(freshest_days)
+    coverage_pts = _score_coverage(has_services, has_location, has_contact)
+
+    # Discovery (0..100): identity + official + evidence strength
+    discovery = 0
+    discovery += 25 if mentions_name else 0
+    discovery += 15 if mentions_domain else 0
+    discovery += 20 if cites_official else 0
+    discovery += 10 if official_cite_count >= 2 else (5 if official_cite_count == 1 else 0)
+    discovery += diversity_pts  # up to 30
+    discovery = _clamp_int(discovery, default=0)
+
+    # Accuracy (proxy) (0..100): official source + coverage + freshness + penalties
+    accuracy = 0
+    accuracy += 35 if cites_official else 15
+    accuracy += 15 if mentions_domain else 0
+    accuracy += 10 if mentions_name else 0
+    accuracy += coverage_pts          # up to 15
+    accuracy += freshness_pts         # up to 10
+
+    # penalties for missing core fields
+    if not has_services:
+        accuracy -= 8
+    if not has_location:
+        accuracy -= 6
+    if not has_contact:
+        accuracy -= 6
+
+    # penalty if lots of other sources but not official
+    if len(uniq_domains) >= 6 and not cites_official:
+        accuracy -= 12
+
+    accuracy = _clamp_int(accuracy, default=50)
+
+    # Authority (0..100): official + diversity + bonus domains + freshness
+    authority = 0
+    authority += 30 if cites_official else 10
+    authority += min(25, len(uniq_domains) * 3)  # 0..25
+    bonus = 0
+    for d in uniq_domains:
+        bonus += AUTHORITY_DOMAIN_BONUS.get(d, 0)
+    authority += _clamp_int(bonus, default=0, lo=0, hi=25)  # up to 25
+    authority += freshness_pts  # up to 10
+    authority += 10 if official_cite_count >= 2 else (5 if official_cite_count == 1 else 0)
+    authority = _clamp_int(authority, default=50)
+
+    overall, package, explanation, strategy = derive_recommendation(discovery, accuracy, authority)
+
+    findings: List[str] = []
+    findings.append("Real scan: web-backed answers + citations captured for auditability.")
+    findings.append(f"Official site cited: {'yes' if cites_official else 'no'} (count: {official_cite_count})")
+    findings.append(f"Unique citation domains: {len(uniq_domains)}")
+    if freshest_days is not None:
+        findings.append(f"Freshest cited source: ~{freshest_days} days old")
+    else:
+        findings.append("Freshness: citation dates not provided by sources")
+    findings.append(f"Comprehensiveness signals: {comprehensiveness_hits}/3 (services/location/contact)")
+
+    metrics = {
+        "engine": raw_bundle["engine"],
+        "provider": "perplexity",
+        "model": PERPLEXITY_MODEL,
+        "business_domain": biz_domain,
+        "mentions_business_name": bool(mentions_name),
+        "mentions_official_domain": bool(mentions_domain),
+        "cites_official_domain": bool(cites_official),
+        "official_citation_count": official_cite_count,
+        "citation_count": len(all_hits),
+        "unique_citation_domains": uniq_domains,
+        "unique_citation_domain_count": len(uniq_domains),
+        "freshest_cited_days": freshest_days,
+        "comprehensiveness": {
+            "has_services": bool(has_services),
+            "has_location": bool(has_location),
+            "has_contact": bool(has_contact),
+            "score_0_to_3": comprehensiveness_hits,
+        },
+        "score_components": {
+            "diversity_pts": diversity_pts,
+            "volume_pts": volume_pts,
+            "freshness_pts": freshness_pts,
+            "coverage_pts": coverage_pts,
+        }
+    }
+
+    # -----------------------------
+    # Evidence → Recommendation Engine (deterministic)
+    # -----------------------------
+    try:
+        from evidence_signals import build_evidence, build_signals
+        from recommendation_rules import build_recommendations
+
+        evidence = build_evidence(metrics)
+        signals = build_signals(evidence=evidence, authority_score=authority)
+
+        rec_bundle = build_recommendations(
+            evidence=evidence,
+            signals=signals,
+            scores={"discovery": discovery, "accuracy": accuracy, "authority": authority},
+        )
+
+        metrics["recommendations"] = {
+            "fix_now": [r.__dict__ for r in rec_bundle.fix_now],
+            "maintain": [r.__dict__ for r in rec_bundle.maintain],
+            "next_scan_focus": rec_bundle.next_scan_focus,
+        }
+        raw_bundle["recommendations"] = metrics["recommendations"]
+    except Exception:
+        metrics["recommendations"] = {"fix_now": [], "maintain": [], "next_scan_focus": []}
+        raw_bundle["recommendations"] = metrics["recommendations"]
+
+    result = RealScanResult(
+        discovery_score=discovery,
+        accuracy_score=accuracy,
+        authority_score=authority,
+        overall_score=overall,
+        package_recommendation=package,
+        package_explanation=explanation,
+        strategy_summary=strategy,
+        findings=findings,
+        provider_results=provider_results,
+        metrics=metrics,
+    )
+
+    raw_bundle["metrics"] = metrics
+    raw_bundle["package"] = {
+        "recommendation": package,
+        "explanation": explanation,
+        "strategy_summary": strategy,
+    }
+    raw_bundle["scores"] = {
+        "discovery": discovery,
+        "accuracy": accuracy,
+        "authority": authority,
+        "overall": overall,
+    }
+
+    return result, raw_bundle
+
 
 
 
