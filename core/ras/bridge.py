@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from uuid import uuid4
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
-from core.ras.models import ScanMeta, ScanResults
+from core.ras.models import ScanMeta, ScanResults, ComponentScores, Finding, RecommendedAction
 from core.ras.scoring import calculate_overall, interpret
 from core.ras.report import generate_client_report, generate_operator_report
 
@@ -13,15 +12,15 @@ def build_ras_scan_results(
     *,
     business_name: str,
     website: Optional[str],
-    component_scores,           # ComponentScores pydantic model
-    findings,                   # list[Finding]
-    recommended_actions,        # list[RecommendedAction]
+    component_scores: ComponentScores,
+    findings: List[Finding],
+    recommended_actions: List[RecommendedAction],
     operator_raw: Dict[str, Any],
     requested_by: Optional[str] = None,
+    scan_id: Optional[str] = None,
 ) -> ScanResults:
-
     meta = ScanMeta(
-        scan_id=str(uuid4()),
+        scan_id=scan_id or "",
         business_name=business_name,
         website=website,
         requested_by=requested_by,
@@ -41,6 +40,7 @@ def build_ras_scan_results(
     )
 
     scan.client_report = generate_client_report(scan)
-    scan.operator_report = generate_operator_report(scan, operator_raw)
+    scan.operator_report = generate_operator_report(scan, operator_raw)  # dict ok
 
     return scan
+
