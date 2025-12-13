@@ -448,4 +448,25 @@ def run_real_scan_perplexity(
     }
 
     return result, raw_bundle
+        # --- Evidence → Recommendation Engine
+    from evidence_signals import build_evidence, build_signals
+    from recommendation_rules import build_recommendations
+
+    evidence = build_evidence(metrics)
+    signals = build_signals(evidence=evidence, authority_score=authority)
+
+    rec_bundle = build_recommendations(
+        evidence=evidence,
+        signals=signals,
+        scores={"discovery": discovery, "accuracy": accuracy, "authority": authority},
+    )
+
+    # store recommendations in metrics + raw_bundle for DB + UI
+    metrics["recommendations"] = {
+        "fix_now": [r.__dict__ for r in rec_bundle.fix_now],
+        "maintain": [r.__dict__ for r in rec_bundle.maintain],
+        "next_scan_focus": rec_bundle.next_scan_focus,
+    }
+    raw_bundle["recommendations"] = metrics["recommendations"]
+
 
