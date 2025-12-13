@@ -241,6 +241,27 @@ def root():
 
 @app.post("/run_scan", response_model=ScanResponse)
 def run_scan(payload: ScanRequest, request: Request):
+
+    # request metadata (hardened for Render / proxies)
+    client_ip = None
+    try:
+        forwarded = request.headers.get("x-forwarded-for")
+        real_ip = request.headers.get("x-real-ip")
+        cf_ip = request.headers.get("cf-connecting-ip")
+
+        if forwarded:
+            client_ip = forwarded.split(",")[0].strip()
+        elif real_ip:
+            client_ip = real_ip.strip()
+        elif cf_ip:
+            client_ip = cf_ip.strip()
+        elif request.client:
+            client_ip = request.client.host
+    except Exception:
+        client_ip = None
+
+    user_agent = request.headers.get("user-agent")
+
     from scan_engine_real import run_real_scan_perplexity
 
     scan_id = uuid.uuid4()
@@ -254,23 +275,7 @@ def run_scan(payload: ScanRequest, request: Request):
             website=str(payload.website),
         )
         raw_llm = raw_bundle
-
-        result = ScanResponse(
-            scan_id=str(scan_id),
-            created_at=created_at.isoformat(),
-            discovery_score=result_obj.discovery_score,
-            accuracy_score=result_obj.accuracy_score,
-            authority_score=result_obj.authority_score,
-            overall_score=result_obj.overall_score,
-            package_recommendation=result_obj.package_recommendation,
-            package_explanation=result_obj.package_explanation,
-            strategy_summary=result_obj.strategy_summary,
-            findings=result_obj.findings,
-        )
-
-    except Exception as e:
-        logger.exception("Real scan failed, falling back")
-        raise HTTPException(status_code=500, detail=str(e))
+        ...
 
     # -----------------------
     # Store main scan
