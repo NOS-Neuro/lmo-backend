@@ -1,15 +1,12 @@
 """
-scan_engine_real.py — VizAI Real Scan Engine (Perplexity-first, production-safe MVP)
+scan_engine_real.py — VizAI Real Scan Engine (Perplexity-first, production-safe)
 
 Real + measurable:
-- Uses Perplexity web-backed search (search_mode="web")
-- Captures answer + citations (search_results)
-- Computes deterministic scores: Discovery / Authority (+ Accuracy proxy)
-- Adds measurable metrics: Freshness, Comprehensiveness
-- Builds Evidence → Signals → Recommendations (stored in raw bundle + operator report)
-
-Honesty:
-- Accuracy is a proxy until you add a ground-truth Truth File compare.
+- Uses Perplexity web-backed search
+- Captures answers + citations
+- Computes deterministic scores with ceilings (not exposed to UI)
+- Builds Evidence → Signals → Recommendations
+- Produces tailored findings + strategy per business
 """
 
 from __future__ import annotations
@@ -23,14 +20,22 @@ from urllib.parse import urlparse
 
 import requests
 
+from evidence_signals import build_evidence, build_signals
+from recommendation_rules import build_recommendations
+
+
+# ---------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------
 
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 PERPLEXITY_MODEL = os.getenv("PERPLEXITY_MODEL", "sonar-pro")
 PERPLEXITY_TIMEOUT = int(os.getenv("PERPLEXITY_TIMEOUT", "45"))
 
-# -----------------------------
+
+# ---------------------------------------------------------------------
 # Types
-# -----------------------------
+# ---------------------------------------------------------------------
 
 @dataclass
 class PerplexityHit:
@@ -65,22 +70,17 @@ class RealScanResult:
     metrics: Dict[str, Any]
 
 
-# -----------------------------
+# ---------------------------------------------------------------------
 # Helpers
-# -----------------------------
+# ---------------------------------------------------------------------
 
-def _clamp_int(v: Any, default: int = 50, lo: int = 0, hi: int = 100) -> int:
-    try:
-        n = int(v)
-    except Exception:
-        n = int(default)
-    return max(lo, min(hi, n))
+def _clamp(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, int(v)))
 
 
 def _domain(url: str) -> str:
     try:
-        host = urlparse(url).netloc.lower().strip()
-        return host.lstrip("www.")
+        return urlparse(url).netloc.lower().replace("www.", "")
     except Exception:
         return ""
 
@@ -89,17 +89,15 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip()).lower()
 
 
-def _contains_name(answer: str, business_name: str) -> bool:
-    a = _norm(answer)
+def _contains_name(text: str, business_name: str) -> bool:
+    t = _norm(text)
     name = _norm(business_name)
     if not name:
         return False
-    if name in a:
+    if name in t:
         return True
-    tokens = [t for t in re.split(r"[^a-z0-9]+", name) if len(t) >= 4]
-    if not tokens:
-        return False
-    return all(t in a for t in tokens[:3])
+    tokens = [x for x in re.split(r"[^a-z0-9]+", name) if len(x) >= 4]
+    return all(tok in t for tok in tokens[:3])
 
 
 def _unique(seq: List[str]) -> List[str]:
@@ -115,73 +113,42 @@ def _unique(seq: List[str]) -> List[str]:
 def _parse_date(d: Optional[str]) -> Optional[datetime]:
     if not d:
         return None
-    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
-        try:
-            return datetime.strptime(d, fmt)
-        except Exception:
-            continue
     try:
         return datetime.fromisoformat(d.replace("Z", "+00:00"))
     except Exception:
         return None
 
 
-# -----------------------------
-# Package recommendation logic
-# -----------------------------
+# ---------------------------------------------------------------------
+# Authority bonus domains
+# ---------------------------------------------------------------------
 
-def derive_recommendation(discovery: int, accuracy: int, authority: int) -> Tuple[int, str, str, str]:
-    overall = int(round((discovery + accuracy + authority) / 3))
-
-    if overall >= 80:
-        package = "Basic LMO"
-        explanation = (
-            "You’re in a strong baseline position. Basic is about monitoring drift, "
-            "tightening a few signals, and keeping answers stable as models and sources change."
-        )
-        strategy = (
-            "Lock a canonical Truth File, verify schema/metadata, and run scheduled rechecks "
-            "to catch drift early. Add 1–2 authority assets if needed."
-        )
-    elif overall >= 40:
-        package = "Standard LMO"
-        explanation = (
-            "AI can likely find you, but gaps or inconsistencies reduce reliability. "
-            "Standard closes gaps and strengthens signals AI uses to describe you correctly."
-        )
-        strategy = (
-            "Improve About/Services/FAQ, deploy schema, and seed a small set of authoritative profiles. "
-            "Then re-scan and compare deltas."
-        )
-    else:
-        package = "Standard LMO + Add-Ons"
-        explanation = (
-            "AI visibility is weak or fragmented. You’ll need foundational correction plus targeted "
-            "authority building to correct the record quickly."
-        )
-        strategy = (
-            "Start with a Truth File + schema deployment, then add authority seeding and directory cleanup. "
-            "Re-scan weekly until stable."
-        )
-
-    return overall, package, explanation, strategy
+AUTHORITY_DOMAIN_BONUS = {
+    "wikipedia.org": 10,
+    "linkedin.com": 6,
+    "crunchbase.com": 6,
+    "bloomberg.com": 8,
+    "reuters.com": 8,
+    "sec.gov": 10,
+    "sedarplus.ca": 10,
+}
 
 
-# -----------------------------
-# Perplexity client
-# -----------------------------
+# ---------------------------------------------------------------------
+# Perplexity Client
+# ---------------------------------------------------------------------
 
 class PerplexityClient:
     BASE_URL = "https://api.perplexity.ai/chat/completions"
 
     def __init__(self, api_key: str, model: str, timeout: int):
         if not api_key:
-            raise ValueError("PERPLEXITY_API_KEY is not set")
+            raise RuntimeError("PERPLEXITY_API_KEY not set")
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
 
-    def chat_web(self, *, system: str, user: str, max_tokens: int = 600) -> Tuple[str, List[PerplexityHit], Dict[str, Any]]:
+    def chat_web(self, system: str, user: str, max_tokens: int = 650):
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -196,103 +163,72 @@ class PerplexityClient:
             "temperature": 0.2,
             "top_p": 0.9,
             "max_tokens": max_tokens,
-            "stream": False,
         }
 
         r = requests.post(self.BASE_URL, headers=headers, json=payload, timeout=self.timeout)
-        if r.status_code < 200 or r.status_code >= 300:
-            raise RuntimeError(f"Perplexity API error {r.status_code}: {r.text}")
-
+        r.raise_for_status()
         data = r.json()
+
         answer = data["choices"][0]["message"]["content"]
-
-        hits: List[PerplexityHit] = []
-        for h in (data.get("search_results") or []):
-            hits.append(
-                PerplexityHit(
-                    title=str(h.get("title") or ""),
-                    url=str(h.get("url") or ""),
-                    date=h.get("date"),
-                )
+        hits = [
+            PerplexityHit(
+                title=h.get("title", ""),
+                url=h.get("url", ""),
+                date=h.get("date"),
             )
-
+            for h in (data.get("search_results") or [])
+        ]
         return answer, hits, data
 
 
-# -----------------------------
-# Scan prompts
-# -----------------------------
+# ---------------------------------------------------------------------
+# Questions
+# ---------------------------------------------------------------------
 
-DEFAULT_QUESTIONS: List[Tuple[str, str]] = [
-    ("baseline_overview", "In 3–6 bullets: what does this company do? Include official site + main services."),
-    ("contact_path", "What is the best contact path (email/form/phone) from sources? If unknown, say unclear."),
-    ("locations_scope", "Where does the company operate (regions/countries)? If unclear, say unclear."),
-    ("proof_points", "List 3 proof points from sources (certifications, customers, industries, capabilities)."),
+DEFAULT_QUESTIONS = [
+    ("overview", "In 3–6 bullets: what does this company do? Cite sources."),
+    ("contact", "What is the best contact path? If unclear, say unclear."),
+    ("locations", "Where does the company operate? If unclear, say unclear."),
+    ("proof", "List 3 proof points (certifications, industries, capabilities)."),
 ]
 
-AUTHORITY_DOMAIN_BONUS = {
-    "wikipedia.org": 10,
-    "linkedin.com": 6,
-    "crunchbase.com": 6,
-    "bloomberg.com": 8,
-    "reuters.com": 8,
-    "sec.gov": 10,
-    "sedarplus.ca": 10,
-}
 
+# ---------------------------------------------------------------------
+# Main Scan Function
+# ---------------------------------------------------------------------
 
-def run_real_scan_perplexity(
-    *,
-    business_name: str,
-    website: str,
-    questions: Optional[List[Tuple[str, str]]] = None,
-) -> Tuple[RealScanResult, Dict[str, Any]]:
-    client = PerplexityClient(
-        api_key=PERPLEXITY_API_KEY,
-        model=PERPLEXITY_MODEL,
-        timeout=PERPLEXITY_TIMEOUT,
-    )
-
+def run_real_scan_perplexity(*, business_name: str, website: str):
+    client = PerplexityClient(PERPLEXITY_API_KEY, PERPLEXITY_MODEL, PERPLEXITY_TIMEOUT)
     biz_domain = _domain(website)
-    qs = questions or DEFAULT_QUESTIONS
 
     provider_results: List[ProviderResult] = []
     raw_bundle: Dict[str, Any] = {
-        "engine": "real_perplexity_mvp_v3",
+        "engine": "real_perplexity_v3",
         "provider": "perplexity",
         "model": PERPLEXITY_MODEL,
         "runs": [],
-        "notes": [
-            "Discovery/Authority are evidence-based from returned citations.",
-            "Accuracy is a proxy until a Truth File compare is implemented.",
-        ],
     }
 
-    system = (
+    system_prompt = (
         "You are an audit assistant using web search. "
-        "Do not guess. If information is missing, say 'unclear'. "
-        "Prefer citing the official website when available."
+        "Do not guess. Cite sources. If unclear, say unclear."
     )
 
-    for prompt_name, q in qs:
-        user = (
-            f"Company name: {business_name}\n"
-            f"Official website (given): {website}\n\n"
-            f"Task: {q}\n\n"
-            f"Rules:\n"
-            f"- Only state facts supported by citations.\n"
-            f"- If uncertain, say 'unclear'.\n"
-            f"- Keep output concise.\n"
+    for prompt_name, question in DEFAULT_QUESTIONS:
+        user_prompt = (
+            f"Company: {business_name}\n"
+            f"Official site: {website}\n\n"
+            f"Task: {question}"
         )
 
-        answer, hits, raw = client.chat_web(system=system, user=user, max_tokens=650)
+        answer, hits, raw = client.chat_web(system_prompt, user_prompt)
 
         provider_results.append(
             ProviderResult(
                 provider="perplexity",
                 model=PERPLEXITY_MODEL,
                 prompt_name=prompt_name,
-                question=q,
+                question=question,
                 answer_text=answer,
                 citations=hits,
             )
@@ -301,175 +237,175 @@ def run_real_scan_perplexity(
         raw_bundle["runs"].append(
             {
                 "prompt_name": prompt_name,
-                "question": q,
                 "answer_text": answer,
                 "search_results": [h.__dict__ for h in hits],
                 "raw": raw,
             }
         )
 
-    # -----------------------------
-    # Aggregate evidence
-    # -----------------------------
-    all_text = "\n".join(r.answer_text for r in provider_results)
+    # -----------------------------------------------------------------
+    # Aggregate Evidence
+    # -----------------------------------------------------------------
 
-    all_hits: List[PerplexityHit] = []
-    for r in provider_results:
-        all_hits.extend(r.citations)
+    all_text = "\n".join(r.answer_text for r in provider_results)
+    all_hits = [h for r in provider_results for h in r.citations]
 
     cite_domains = [_domain(h.url) for h in all_hits if h.url]
-    uniq_domains = _unique([d for d in cite_domains if d])
+    uniq_domains = _unique(cite_domains)
 
     mentions_name = _contains_name(all_text, business_name)
-    mentions_domain = bool(biz_domain and biz_domain in _norm(all_text))
-    cites_official = bool(biz_domain and any(d == biz_domain for d in cite_domains))
+    mentions_domain = biz_domain in _norm(all_text) if biz_domain else False
+    cites_official = biz_domain in uniq_domains if biz_domain else False
 
-    parsed_dates = [_parse_date(h.date) for h in all_hits]
-    parsed_dates = [d for d in parsed_dates if d is not None]
+    dates = [_parse_date(h.date) for h in all_hits if h.date]
+    dates = [d for d in dates if d]
     freshest_days = None
-    if parsed_dates:
-        newest = max(parsed_dates)
-        now = datetime.now(timezone.utc)
-        if newest.tzinfo is None:
-            newest = newest.replace(tzinfo=timezone.utc)
-        freshest_days = max(0, int((now - newest).total_seconds() // 86400))
+    if dates:
+        newest = max(dates)
+        freshest_days = int((datetime.now(timezone.utc) - newest).days)
 
     t = _norm(all_text)
-    has_services = any(k in t for k in ["services", "solutions", "we provide", "offerings"])
-    has_location = any(k in t for k in ["located", "based in", "headquartered", "operations", "serve"])
-    has_contact = any(k in t for k in ["contact", "email", "phone", "reach", "sales"])
-    comprehensiveness_hits = sum([has_services, has_location, has_contact])  # 0..3
+    has_services = any(k in t for k in ["services", "solutions", "offer"])
+    has_location = any(k in t for k in ["located", "based", "serve"])
+    has_contact = any(k in t for k in ["contact", "email", "phone"])
 
-    # -----------------------------
-    # Scoring v2.1: ceilings + confidence penalty (prevents 100/100)
-    # -----------------------------
-    MAX_CATEGORY = 95
-    MAX_OVERALL = 92
+    coverage_hits = sum([has_services, has_location, has_contact])
 
-    discovery_base = 0
-    discovery_base += 40 if mentions_name else 0
-    discovery_base += 20 if mentions_domain else 0
-    discovery_base += 35 if cites_official else 0
-    discovery_base += 5 if has_services else 0
-    discovery_base += 3 if has_location else 0
-    discovery_base += 2 if has_contact else 0
+    # -----------------------------------------------------------------
+    # Scoring (with ceilings, not exposed)
+    # -----------------------------------------------------------------
 
-    accuracy_base = 0
-    accuracy_base += 55 if cites_official else 20
-    accuracy_base += 15 if mentions_domain else 0
-    accuracy_base += 10 if mentions_name else 0
-    accuracy_base += 10 if (has_services and has_contact) else 0
-
-    authority_base = 0
-    authority_base += 45 if cites_official else 10
-    authority_base += min(25, len(uniq_domains) * 3)
-    bonus = 0
-    for d in uniq_domains:
-        bonus += AUTHORITY_DOMAIN_BONUS.get(d, 0)
-    authority_base += min(15, bonus)
-    authority_base += 5 if (len(uniq_domains) >= 10) else 0
-
-    coverage_count = sum([has_services, has_location, has_contact])  # 0..3
     confidence = 0.78
-    confidence += 0.07 if cites_official else 0.0
-    confidence += 0.04 if mentions_domain else 0.0
-    confidence += 0.04 if mentions_name else 0.0
-    confidence += 0.03 * (coverage_count / 3.0)
-    confidence += 0.04 if len(uniq_domains) >= 8 else 0.0
-    confidence = max(0.78, min(0.97, confidence))
+    confidence += 0.07 if cites_official else 0
+    confidence += 0.04 if mentions_domain else 0
+    confidence += 0.04 if mentions_name else 0
+    confidence += 0.03 * (coverage_hits / 3)
+    confidence += 0.04 if len(uniq_domains) >= 8 else 0
+    confidence = min(confidence, 0.97)
 
-    discovery = _clamp_int(round(discovery_base * confidence), default=50, lo=0, hi=MAX_CATEGORY)
-    accuracy = _clamp_int(round(accuracy_base * confidence), default=50, lo=0, hi=MAX_CATEGORY)
-    authority = _clamp_int(round(authority_base * confidence), default=50, lo=0, hi=MAX_CATEGORY)
+    discovery = round((40 if mentions_name else 0
+                       + 20 if mentions_domain else 0
+                       + 35 if cites_official else 0
+                       + coverage_hits * 3) * confidence)
 
-    overall = int(round((discovery + accuracy + authority) / 3))
-    overall = min(overall, MAX_OVERALL)
+    accuracy = round((55 if cites_official else 20
+                      + 15 if mentions_domain else 0
+                      + 10 if mentions_name else 0
+                      + 10 if coverage_hits >= 2 else 0) * confidence)
 
-    _, package, explanation, strategy = derive_recommendation(discovery, accuracy, authority)
+    authority = 45 if cites_official else 10
+    authority += min(25, len(uniq_domains) * 3)
+    authority += min(15, sum(AUTHORITY_DOMAIN_BONUS.get(d, 0) for d in uniq_domains))
+    authority = round(authority * confidence)
 
-    findings: List[str] = []
-    findings.append("Real scan: web-backed answers + citations captured for auditability.")
-    findings.append(f"Official site cited: {'yes' if cites_official else 'no'}")
+    discovery = _clamp(discovery, 0, 95)
+    accuracy = _clamp(accuracy, 0, 95)
+    authority = _clamp(authority, 0, 95)
 
-# Discovery/authority specifics
-    if len(uniq_domains) <= 4:
-    findings.append(f"Authority footprint is narrow: only {len(uniq_domains)} unique citation domains.")
-    elif len(uniq_domains) >= 10:
-    findings.append(f"Authority footprint is strong: {len(uniq_domains)} unique citation domains.")
-    else:
-    findings.append(f"Authority footprint: {len(uniq_domains)} unique citation domains.")
+    overall = min(round((discovery + accuracy + authority) / 3), 92)
 
-# Freshness specifics
-    if freshest_days is None:
-    findings.append("Freshness: citation dates were not provided by sources (hard to prove recency).")
-    elif freshest_days <= 30:
-    findings.append(f"Freshness looks good: newest cited source is ~{freshest_days} days old.")
-    elif freshest_days <= 90:
-    findings.append(f"Freshness is moderate: newest cited source is ~{freshest_days} days old.")
-    else:
-    findings.append(f"Freshness is stale: newest cited source is ~{freshest_days} days old.")
+    # -----------------------------------------------------------------
+    # Evidence → Signals → Recommendations
+    # -----------------------------------------------------------------
 
-# Coverage specifics
-    coverage_bits = []
-    if has_services:
-    coverage_bits.append("services")
-    if has_location:
-    coverage_bits.append("location")
-    if has_contact:
-    coverage_bits.append("contact")
-
-    if comprehensiveness_hits == 3:
-    findings.append("Coverage signals are complete: services, location, and contact all surfaced in answers.")
-    else:
-    missing = [x for x in ["services", "location", "contact"] if x not in coverage_bits]
-    findings.append(f"Coverage gaps detected: missing/unclear {', '.join(missing)} in answers.")
-
-
-    
     metrics = {
-        "engine": raw_bundle["engine"],
-        "provider": "perplexity",
-        "model": PERPLEXITY_MODEL,
         "business_domain": biz_domain,
-        "mentions_business_name": bool(mentions_name),
-        "mentions_official_domain": bool(mentions_domain),
-        "cites_official_domain": bool(cites_official),
+        "mentions_business_name": mentions_name,
+        "mentions_official_domain": mentions_domain,
+        "cites_official_domain": cites_official,
         "citation_count": len(all_hits),
         "unique_citation_domains": uniq_domains,
-        "unique_citation_domain_count": len(uniq_domains),
         "freshest_cited_days": freshest_days,
         "comprehensiveness": {
-            "has_services": bool(has_services),
-            "has_location": bool(has_location),
-            "has_contact": bool(has_contact),
-            "score_0_to_3": comprehensiveness_hits,
+            "has_services": has_services,
+            "has_location": has_location,
+            "has_contact": has_contact,
         },
-        "confidence": round(float(confidence), 3),
-        "score_ceiling": {"max_category": MAX_CATEGORY, "max_overall": MAX_OVERALL},
     }
-
-    # -----------------------------
-    # Evidence → Signals → Recommendations (stored in raw_bundle)
-    # -----------------------------
-    from evidence_signals import build_evidence, build_signals
-    from recommendation_rules import build_recommendations
 
     evidence = build_evidence(metrics)
     signals = build_signals(evidence=evidence, authority_score=authority)
-
     rec_bundle = build_recommendations(
         evidence=evidence,
         signals=signals,
         scores={"discovery": discovery, "accuracy": accuracy, "authority": authority},
     )
 
-    metrics["recommendations"] = {
+    # -----------------------------------------------------------------
+    # Tailored Findings
+    # -----------------------------------------------------------------
+
+    findings: List[str] = [
+        "Real scan: web-backed answers and citations captured."
+    ]
+
+    findings.append(f"Official site cited: {'yes' if cites_official else 'no'}")
+
+    if len(uniq_domains) >= 10:
+        findings.append(f"Strong authority footprint: {len(uniq_domains)} unique citation domains.")
+    elif len(uniq_domains) >= 5:
+        findings.append(f"Moderate authority footprint: {len(uniq_domains)} unique citation domains.")
+    else:
+        findings.append(f"Limited authority footprint: only {len(uniq_domains)} citation domains.")
+
+    if freshest_days is None:
+        findings.append("Freshness could not be confirmed from citation dates.")
+    elif freshest_days <= 30:
+        findings.append(f"Fresh sources detected (newest ~{freshest_days} days old).")
+    else:
+        findings.append(f"Sources appear stale (newest ~{freshest_days} days old).")
+
+    if coverage_hits == 3:
+        findings.append("Coverage is complete: services, location, and contact surfaced.")
+    else:
+        missing = [k for k, v in {
+            "services": has_services,
+            "location": has_location,
+            "contact": has_contact,
+        }.items() if not v]
+        findings.append(f"Coverage gaps detected: {', '.join(missing)}.")
+
+    # -----------------------------------------------------------------
+    # Tailored Strategy Summary
+    # -----------------------------------------------------------------
+
+    focus = rec_bundle.next_scan_focus or []
+    top_fixes = [r.title for r in rec_bundle.fix_now[:2]]
+
+    strategy_parts = []
+    if focus:
+        strategy_parts.append("Next focus: " + ", ".join(focus) + ".")
+    if top_fixes:
+        strategy_parts.append("Top fixes: " + " / ".join(top_fixes) + ".")
+    strategy_parts.append("Re-scan after updates to confirm stability.")
+
+    strategy = " ".join(strategy_parts)
+
+    # Package text (unchanged semantics)
+    if overall >= 80:
+        package = "Basic LMO"
+        explanation = "Your AI visibility is strong. Focus on monitoring and drift prevention."
+    elif overall >= 40:
+        package = "Standard LMO"
+        explanation = "AI visibility is partial. Address gaps to stabilize answers."
+    else:
+        package = "Standard LMO + Add-Ons"
+        explanation = "AI visibility is weak. Foundational correction is required."
+
+    raw_bundle["metrics"] = metrics
+    raw_bundle["recommendations"] = {
         "fix_now": [r.__dict__ for r in rec_bundle.fix_now],
         "maintain": [r.__dict__ for r in rec_bundle.maintain],
         "next_scan_focus": rec_bundle.next_scan_focus,
     }
+    raw_bundle["scores"] = {
+        "discovery": discovery,
+        "accuracy": accuracy,
+        "authority": authority,
+        "overall": overall,
+    }
 
-    result = RealScanResult(
+    return RealScanResult(
         discovery_score=discovery,
         accuracy_score=accuracy,
         authority_score=authority,
@@ -480,23 +416,7 @@ def run_real_scan_perplexity(
         findings=findings,
         provider_results=provider_results,
         metrics=metrics,
-    )
-
-    raw_bundle["metrics"] = metrics
-    raw_bundle["recommendations"] = metrics["recommendations"]
-    raw_bundle["package"] = {
-        "recommendation": package,
-        "explanation": explanation,
-        "strategy_summary": strategy,
-    }
-    raw_bundle["scores"] = {
-        "discovery": discovery,
-        "accuracy": accuracy,
-        "authority": authority,
-        "overall": overall,
-    }
-
-    return result, raw_bundle
+    ), raw_bundle
 
 
 
