@@ -1,17 +1,14 @@
 import os
-import json
 import uuid
 import logging
 from datetime import datetime, timezone
 from typing import List, Optional, Any, Dict, Tuple
 
-import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, HttpUrl, EmailStr, field_validator
 
-import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import Json
 
@@ -54,7 +51,7 @@ logger.info("OpenAI fallback scan: %s", "READY" if OPENAI_API_KEY else "NOT CONF
 
 app = FastAPI(
     title="VizAI Scan API",
-    version="1.4.1",
+    version="1.4.2",
     description="VizAI: evidence-based LLM visibility scanning with competitor baselines.",
 )
 
@@ -166,7 +163,6 @@ def return_db_conn(conn) -> None:
         except Exception as e:
             logger.exception("Failed to return DB connection to pool: %s", e)
 
-
 # -------------------------------------------------------------------
 # DB Schema
 # -------------------------------------------------------------------
@@ -237,7 +233,6 @@ def ensure_tables_and_migrations() -> None:
     finally:
         return_db_conn(conn)
 
-
 # -------------------------------------------------------------------
 # DB Inserts
 # -------------------------------------------------------------------
@@ -303,7 +298,7 @@ def insert_main_scan(
                 ),
             )
         conn.commit()
-        logger.info("Inserted scan row: %s", str(scan_id))
+        logger.info("Inserted main scan row: %s", str(scan_id))
     finally:
         return_db_conn(conn)
 
@@ -350,9 +345,9 @@ def insert_competitor_scan(
                 ),
             )
         conn.commit()
+        logger.info("Inserted competitor scan row: parent=%s name=%s", str(parent_scan_id), competitor_name)
     finally:
         return_db_conn(conn)
-
 
 # -------------------------------------------------------------------
 # Startup
@@ -365,7 +360,6 @@ def startup() -> None:
         init_db_pool()
         ensure_tables_and_migrations()
     logger.info("VizAI API started")
-
 
 # -------------------------------------------------------------------
 # Routes
@@ -419,7 +413,6 @@ def health():
 
 @app.post("/run_scan", response_model=ScanResponse)
 def run_scan(payload: ScanRequest, request: Request):
-
     # request metadata (Render/proxies safe)
     client_ip = None
     try:
@@ -440,8 +433,15 @@ def run_scan(payload: ScanRequest, request: Request):
 
     user_agent = request.headers.get("user-agent")
 
-    logger.info("Scan start: biz=%s db_url_present=%s ip=%s ua_present=%s competitors=%s",
-                payload.businessName, bool(DATABASE_URL), client_ip, bool(user_agent), len(payload.competitors))
+    logger.info(
+        "Scan start: biz=%s db_url_present=%s ip=%s ua_present=%s competitors=%s questions=%s",
+        payload.businessName,
+        bool(DATABASE_URL),
+        client_ip,
+        bool(user_agent),
+        len(payload.competitors),
+        len(payload.questions),
+    )
 
     from scan_engine_real import run_real_scan_perplexity
 
@@ -450,18 +450,19 @@ def run_scan(payload: ScanRequest, request: Request):
 
     raw_llm: Optional[Dict[str, Any]] = None
 
-    # Main scan (real scan only for now)
+    # --- Main scan
     try:
-        custom_questions = None
+        custom_questions: Optional[List[Tuple[str, str]]] = None
         if payload.questions:
             custom_questions = [(q.prompt_name, q.question) for q in payload.questions]
 
         result_obj, raw_bundle = run_real_scan_perplexity(
             business_name=payload.businessName,
             website=str(payload.website),
-            competitors=[{"name": c.name, "website": str(c.website)} for c in (payload.competitors or [])],
             questions=custom_questions,
+            competitors=[{"name": c.name, "website": str(c.website)} for c in (payload.competitors or [])],
         )
+
         raw_llm = raw_bundle
 
         result = ScanResponse(
@@ -477,12 +478,11 @@ def run_scan(payload: ScanRequest, request: Request):
             findings=list(result_obj.findings or []),
             email_sent=False,
         )
-
     except Exception as e:
         logger.exception("Real scan failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Store main scan (NOT best-effort while debugging: fail loud if DB configured)
+    # --- Store main scan (fail loud if DB configured)
     if DATABASE_URL:
         try:
             insert_main_scan(
@@ -497,6 +497,29 @@ def run_scan(payload: ScanRequest, request: Request):
         except Exception as e:
             logger.exception("DB insert failed: %s", e)
             raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
+
+        # --- Competitor baseline scans (best-effort; never break main scan)
+        for c in (payload.competitors or []):
+            try:
+                comp_obj, comp_bundle = run_real_scan_perplexity(
+                    business_name=c.name,
+                    website=str(c.website),
+                )
+                insert_competitor_scan(
+                    parent_scan_id=scan_id,
+                    created_at=created_at,
+                    competitor_name=c.name,
+                    competitor_website=str(c.website),
+                    scores={
+                        "discovery": int(comp_obj.discovery_score),
+                        "accuracy": int(comp_obj.accuracy_score),
+                        "authority": int(comp_obj.authority_score),
+                        "overall": int(comp_obj.overall_score),
+                    },
+                    raw_bundle=comp_bundle,
+                )
+            except Exception as e:
+                logger.exception("Competitor scan/insert failed (non-fatal) for %s: %s", c.name, e)
 
     return result
 
@@ -569,6 +592,8 @@ def get_scan_competitors(scan_id: str):
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+l})
+
 
 
 
