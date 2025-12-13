@@ -3,7 +3,7 @@ import json
 import uuid
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Tuple
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
@@ -40,10 +40,7 @@ NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-EMAIL_NOTIFICATIONS_ENABLED = bool(
-    RESEND_API_KEY and NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO
-)
-
+EMAIL_NOTIFICATIONS_ENABLED = bool(RESEND_API_KEY and NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO)
 FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 
 logger.info("Database storage: %s", "ENABLED" if DATABASE_URL else "DISABLED")
@@ -57,7 +54,7 @@ logger.info("OpenAI fallback scan: %s", "READY" if OPENAI_API_KEY else "NOT CONF
 
 app = FastAPI(
     title="VizAI Scan API",
-    version="1.4.0",
+    version="1.4.1",
     description="VizAI: evidence-based LLM visibility scanning with competitor baselines.",
 )
 
@@ -134,7 +131,7 @@ DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "5"))
 _db_pool: Optional[pool.ThreadedConnectionPool] = None
 
 
-def init_db_pool():
+def init_db_pool() -> None:
     global _db_pool
     if not DATABASE_URL or _db_pool:
         return
@@ -143,7 +140,7 @@ def init_db_pool():
         maxconn=DB_POOL_MAX,
         dsn=DATABASE_URL,
     )
-    logger.info("DB pool initialized")
+    logger.info("DB pool initialized (min=%s max=%s)", DB_POOL_MIN, DB_POOL_MAX)
 
 
 def get_db_conn():
@@ -151,19 +148,24 @@ def get_db_conn():
         return None
     try:
         return _db_pool.getconn()
-    except Exception:
+    except Exception as e:
+        logger.exception("Failed to get DB connection from pool: %s", e)
         return None
 
 
-def return_db_conn(conn):
+def return_db_conn(conn) -> None:
     if _db_pool and conn:
-        _db_pool.putconn(conn)
+        try:
+            _db_pool.putconn(conn)
+        except Exception as e:
+            logger.exception("Failed to return DB connection to pool: %s", e)
+
 
 # -------------------------------------------------------------------
 # DB Schema
 # -------------------------------------------------------------------
 
-def ensure_tables_and_migrations():
+def ensure_tables_and_migrations() -> None:
     if not DATABASE_URL:
         return
 
@@ -187,8 +189,13 @@ def ensure_tables_and_migrations():
 
       findings JSONB NOT NULL,
       raw_llm JSONB,
-      email_sent BOOLEAN DEFAULT FALSE
+      email_sent BOOLEAN DEFAULT FALSE,
+
+      ip_address TEXT,
+      user_agent TEXT
     );
+
+    CREATE INDEX IF NOT EXISTS idx_vizai_scans_created_at ON vizai_scans(created_at DESC);
 
     CREATE TABLE IF NOT EXISTS vizai_competitor_scans (
       id BIGSERIAL PRIMARY KEY,
@@ -205,27 +212,154 @@ def ensure_tables_and_migrations():
 
       raw_bundle JSONB
     );
+
+    CREATE INDEX IF NOT EXISTS idx_vizai_comp_parent ON vizai_competitor_scans(parent_scan_id);
     """
 
-    conn = get_db_conn()
-    if not conn:
+    conn = None
+    try:
+        conn = get_db_conn()
+        if not conn:
+            logger.warning("DB unavailable; cannot ensure tables")
+            return
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute(ddl)
+        logger.info("DB tables ensured")
+    except Exception as e:
+        logger.exception("Failed ensuring tables/migrations: %s", e)
+    finally:
+        return_db_conn(conn)
+
+
+# -------------------------------------------------------------------
+# DB Inserts
+# -------------------------------------------------------------------
+
+def insert_main_scan(
+    *,
+    scan_id: uuid.UUID,
+    created_at: datetime,
+    payload: ScanRequest,
+    result: ScanResponse,
+    raw_llm: Optional[Dict[str, Any]],
+    ip_address: Optional[str],
+    user_agent: Optional[str],
+) -> None:
+    if not DATABASE_URL:
         return
 
-    conn.autocommit = True
-    with conn.cursor() as cur:
-        cur.execute(ddl)
-    return_db_conn(conn)
+    conn = None
+    try:
+        conn = get_db_conn()
+        if not conn:
+            raise RuntimeError("DB unavailable (no connection from pool)")
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO vizai_scans (
+                    scan_id, created_at, business_name, website, contact_email, request_contact,
+                    discovery_score, accuracy_score, authority_score, overall_score,
+                    package_recommendation, package_explanation, strategy_summary,
+                    findings, raw_llm, email_sent, ip_address, user_agent
+                )
+                VALUES (
+                    %s,%s,%s,%s,%s,%s,
+                    %s,%s,%s,%s,
+                    %s,%s,%s,
+                    %s,%s,%s,%s,%s
+                )
+                """,
+                (
+                    str(scan_id),
+                    created_at,
+                    payload.businessName,
+                    str(payload.website),
+                    str(payload.contactEmail),
+                    bool(payload.requestContact),
+
+                    int(result.discovery_score),
+                    int(result.accuracy_score),
+                    int(result.authority_score),
+                    int(result.overall_score),
+
+                    result.package_recommendation,
+                    result.package_explanation,
+                    result.strategy_summary,
+
+                    Json(result.findings),
+                    Json(raw_llm) if raw_llm is not None else None,
+                    bool(result.email_sent) if result.email_sent is not None else False,
+
+                    ip_address,
+                    user_agent,
+                ),
+            )
+        conn.commit()
+        logger.info("Inserted scan row: %s", str(scan_id))
+    finally:
+        return_db_conn(conn)
+
+
+def insert_competitor_scan(
+    *,
+    parent_scan_id: uuid.UUID,
+    created_at: datetime,
+    competitor_name: str,
+    competitor_website: str,
+    scores: Dict[str, int],
+    raw_bundle: Dict[str, Any],
+) -> None:
+    if not DATABASE_URL:
+        return
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        if not conn:
+            raise RuntimeError("DB unavailable (no connection from pool)")
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO vizai_competitor_scans (
+                    parent_scan_id, created_at,
+                    competitor_name, competitor_website,
+                    discovery_score, accuracy_score, authority_score, overall_score,
+                    raw_bundle
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    str(parent_scan_id),
+                    created_at,
+                    competitor_name,
+                    competitor_website,
+                    int(scores.get("discovery", 0)),
+                    int(scores.get("accuracy", 0)),
+                    int(scores.get("authority", 0)),
+                    int(scores.get("overall", 0)),
+                    Json(raw_bundle),
+                ),
+            )
+        conn.commit()
+    finally:
+        return_db_conn(conn)
+
 
 # -------------------------------------------------------------------
 # Startup
 # -------------------------------------------------------------------
 
 @app.on_event("startup")
-def startup():
+def startup() -> None:
+    logger.info("VizAI API starting… DATABASE_URL present=%s", bool(DATABASE_URL))
     if DATABASE_URL:
         init_db_pool()
         ensure_tables_and_migrations()
     logger.info("VizAI API started")
+
 
 # -------------------------------------------------------------------
 # Routes
@@ -235,6 +369,44 @@ def startup():
 def root():
     return {"status": "ok", "service": "VizAI"}
 
+
+@app.get("/health")
+def health():
+    services = {
+        "api": "operational",
+        "database": "not_configured" if not DATABASE_URL else "unknown",
+        "email": "operational" if EMAIL_NOTIFICATIONS_ENABLED else "not_configured",
+        "perplexity": "operational" if PERPLEXITY_API_KEY else "not_configured",
+        "openai_fallback": "operational" if OPENAI_API_KEY else "not_configured",
+    }
+
+    db_identity = None
+    if DATABASE_URL:
+        conn = None
+        try:
+            conn = get_db_conn()
+            if conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.execute("SELECT current_database(), current_user")
+                    db_identity = cur.fetchone()
+                services["database"] = "operational"
+            else:
+                services["database"] = "unavailable"
+        except Exception:
+            services["database"] = "error"
+        finally:
+            return_db_conn(conn)
+
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "services": services,
+        "db_url_present": bool(DATABASE_URL),
+        "db_identity": {"database": db_identity[0], "user": db_identity[1]} if db_identity else None,
+    }
+
+
 # -----------------------
 # RUN SCAN
 # -----------------------
@@ -242,9 +414,7 @@ def root():
 @app.post("/run_scan", response_model=ScanResponse)
 def run_scan(payload: ScanRequest, request: Request):
 
-    # -------------------------
     # request metadata (Render/proxies safe)
-    # -------------------------
     client_ip = None
     try:
         forwarded = request.headers.get("x-forwarded-for")
@@ -264,20 +434,22 @@ def run_scan(payload: ScanRequest, request: Request):
 
     user_agent = request.headers.get("user-agent")
 
-    # -------------------------
-    # scan
-    # -------------------------
+    logger.info("Scan start: biz=%s db_url_present=%s ip=%s ua_present=%s competitors=%s",
+                payload.businessName, bool(DATABASE_URL), client_ip, bool(user_agent), len(payload.competitors))
+
     from scan_engine_real import run_real_scan_perplexity
 
     scan_id = uuid.uuid4()
     created_at = datetime.now(timezone.utc)
 
-    raw_llm = None
+    raw_llm: Optional[Dict[str, Any]] = None
 
+    # Main scan (real scan only for now)
     try:
         result_obj, raw_bundle = run_real_scan_perplexity(
             business_name=payload.businessName,
             website=str(payload.website),
+            competitors=[{"name": c.name, "website": str(c.website)} for c in (payload.competitors or [])],
         )
         raw_llm = raw_bundle
 
@@ -299,69 +471,24 @@ def run_scan(payload: ScanRequest, request: Request):
         logger.exception("Real scan failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
-    # -------------------------
-    # store scan (best-effort)
-    # -------------------------
-    try:
-        if DATABASE_URL:
-            insert_scan(
+    # Store main scan (NOT best-effort while debugging: fail loud if DB configured)
+    if DATABASE_URL:
+        try:
+            insert_main_scan(
                 scan_id=scan_id,
                 created_at=created_at,
-                request_obj=payload,
+                payload=payload,
                 result=result,
                 raw_llm=raw_llm,
                 ip_address=client_ip,
                 user_agent=user_agent,
-                email_sent=bool(result.email_sent),
             )
-    except Exception as e:
-        logger.exception("DB insert failed (non-fatal): %s", e)
+        except Exception as e:
+            logger.exception("DB insert failed: %s", e)
+            raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
 
     return result
 
-
-    # -----------------------
-    # Store main scan
-    # -----------------------
-
-    conn = get_db_conn()
-    if conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO vizai_scans VALUES (
-                  %s,%s,%s,%s,%s,%s,
-                  %s,%s,%s,%s,
-                  %s,%s,%s,
-                  %s,%s,%s
-                )
-                """,
-                (
-                    str(scan_id),
-                    created_at,
-                    payload.businessName,
-                    str(payload.website),
-                    str(payload.contactEmail),
-                    bool(payload.requestContact),
-
-                    result.discovery_score,
-                    result.accuracy_score,
-                    result.authority_score,
-                    result.overall_score,
-
-                    result.package_recommendation,
-                    result.package_explanation,
-                    result.strategy_summary,
-
-                    Json(result.findings),
-                    Json(raw_llm),
-                    False,
-                ),
-            )
-            conn.commit()
-        return_db_conn(conn)
-
-    return result
 
 # -----------------------
 # GET COMPETITOR BASELINE
@@ -377,49 +504,52 @@ def get_scan_competitors(scan_id: str):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid scan ID")
 
-    conn = get_db_conn()
-    if not conn:
-        raise HTTPException(status_code=503, detail="Database unavailable")
+    conn = None
+    try:
+        conn = get_db_conn()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database unavailable")
 
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT
-              competitor_name,
-              competitor_website,
-              discovery_score,
-              accuracy_score,
-              authority_score,
-              overall_score,
-              created_at
-            FROM vizai_competitor_scans
-            WHERE parent_scan_id = %s
-            ORDER BY overall_score DESC
-            """,
-            (str(scan_uuid),),
-        )
-        rows = cur.fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  competitor_name,
+                  competitor_website,
+                  discovery_score,
+                  accuracy_score,
+                  authority_score,
+                  overall_score,
+                  created_at
+                FROM vizai_competitor_scans
+                WHERE parent_scan_id = %s
+                ORDER BY overall_score DESC
+                """,
+                (str(scan_uuid),),
+            )
+            rows = cur.fetchall()
 
-    return_db_conn(conn)
+        return {
+            "scan_id": scan_id,
+            "count": len(rows),
+            "competitors": [
+                {
+                    "name": r[0],
+                    "website": r[1],
+                    "scores": {
+                        "discovery": r[2],
+                        "accuracy": r[3],
+                        "authority": r[4],
+                        "overall": r[5],
+                    },
+                    "created_at": r[6].isoformat() if r[6] else None,
+                }
+                for r in rows
+            ],
+        }
+    finally:
+        return_db_conn(conn)
 
-    return {
-        "scan_id": scan_id,
-        "count": len(rows),
-        "competitors": [
-            {
-                "name": r[0],
-                "website": r[1],
-                "scores": {
-                    "discovery": r[2],
-                    "accuracy": r[3],
-                    "authority": r[4],
-                    "overall": r[5],
-                },
-                "created_at": r[6].isoformat() if r[6] else None,
-            }
-            for r in rows
-        ],
-    }
 
 # -------------------------------------------------------------------
 # Error Handlers
@@ -427,10 +557,8 @@ def get_scan_competitors(scan_id: str):
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": exc.detail},
-    )
+    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+
 
 
 
