@@ -1,14 +1,15 @@
 import os
+import json
 import uuid
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import List, Optional, Any, Dict
 
 import requests
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, EmailStr, HttpUrl, field_validator
+from pydantic import BaseModel, HttpUrl, EmailStr, field_validator
 
 import psycopg2
 from psycopg2 import pool
@@ -28,17 +29,25 @@ logger = logging.getLogger("vizai")
 # Config / Environment
 # -------------------------------------------------------------------
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# Perplexity env vars are used inside scan_engine_real.py, but we log readiness here
+PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
+
 RESEND_API_KEY = os.getenv("RESEND_API_KEY")
 NOTIFY_EMAIL_FROM = os.getenv("NOTIFY_EMAIL_FROM")  # e.g. scan@vizai.io
-NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO")      # e.g. you@yourmail.com
+NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO")      # admin inbox
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # Render Postgres connection string
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 EMAIL_NOTIFICATIONS_ENABLED = bool(RESEND_API_KEY and NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO)
+FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
 
-logger.info("Email notifications: %s", "ENABLED" if EMAIL_NOTIFICATIONS_ENABLED else "DISABLED")
 logger.info("Database storage: %s", "ENABLED" if DATABASE_URL else "DISABLED")
+logger.info("Email notifications: %s", "ENABLED" if EMAIL_NOTIFICATIONS_ENABLED else "DISABLED")
+logger.info("Perplexity real scan: %s", "READY" if PERPLEXITY_API_KEY else "NOT CONFIGURED")
+logger.info("OpenAI fallback scan: %s", "READY" if OPENAI_API_KEY else "NOT CONFIGURED")
 
 # -------------------------------------------------------------------
 # FastAPI App
@@ -46,8 +55,8 @@ logger.info("Database storage: %s", "ENABLED" if DATABASE_URL else "DISABLED")
 
 app = FastAPI(
     title="VizAI Scan API",
-    version="2.0.0",
-    description="VizAI: Real AI visibility scan (Perplexity web-backed evidence).",
+    version="1.3.0",
+    description="VizAI: real scan (Perplexity web-backed) with honest fallback (OpenAI estimation).",
 )
 
 app.add_middleware(
@@ -67,7 +76,7 @@ class ScanRequest(BaseModel):
     website: HttpUrl
     contactEmail: EmailStr
     requestContact: bool = False
-    models: List[str] = []  # kept for backward compatibility
+    models: List[str] = []  # backwards compatibility
 
     @field_validator("businessName")
     @classmethod
@@ -82,7 +91,7 @@ class ScanRequest(BaseModel):
     @field_validator("website")
     @classmethod
     def validate_website(cls, v: HttpUrl) -> HttpUrl:
-        # basic SSRF reduction
+        # Basic SSRF reduction: block localhost + common private ranges (best-effort)
         url_str = str(v).lower()
         blocked = ["localhost", "127.0.0.1", "0.0.0.0", "::1"]
         if any(b in url_str for b in blocked):
@@ -104,16 +113,13 @@ class ScanResponse(BaseModel):
     package_recommendation: str
     package_explanation: str
     strategy_summary: str
-
     findings: List[str]
 
-    # New, optional (safe for existing frontend)
-    recommendations: Optional[Dict[str, Any]] = None
-
     email_sent: Optional[bool] = None
+
     disclaimer: str = (
-        "This scan is web-backed (Perplexity search) and stores citations as evidence. "
-        "Accuracy is currently a proxy until a ground-truth Truth File comparison is added."
+        "This scan is evidence-based when run in Real Scan mode (web-backed answers + citations). "
+        "If Real Scan is unavailable, it falls back to an honest AI-assisted estimate."
     )
 
 # -------------------------------------------------------------------
@@ -125,38 +131,38 @@ DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "5"))
 
 _db_pool: Optional[pool.ThreadedConnectionPool] = None
 
-
 def init_db_pool() -> None:
     global _db_pool
     if not DATABASE_URL or _db_pool:
         return
-    _db_pool = pool.ThreadedConnectionPool(minconn=DB_POOL_MIN, maxconn=DB_POOL_MAX, dsn=DATABASE_URL)
+    _db_pool = pool.ThreadedConnectionPool(
+        minconn=DB_POOL_MIN,
+        maxconn=DB_POOL_MAX,
+        dsn=DATABASE_URL,
+    )
     logger.info("DB pool initialized (min=%s max=%s)", DB_POOL_MIN, DB_POOL_MAX)
-
 
 def get_db_conn():
     if not _db_pool:
         return None
     try:
         return _db_pool.getconn()
-    except Exception:
-        logger.exception("Failed to get DB connection")
+    except Exception as e:
+        logger.exception("Failed to get DB connection from pool: %s", e)
         return None
-
 
 def return_db_conn(conn):
     if _db_pool and conn:
         try:
             _db_pool.putconn(conn)
-        except Exception:
-            logger.exception("Failed to return DB connection")
-
+        except Exception as e:
+            logger.exception("Failed to return DB connection to pool: %s", e)
 
 def ensure_tables_and_migrations() -> None:
     if not DATABASE_URL:
         return
 
-    ddl = """
+    ddl_create = """
     CREATE TABLE IF NOT EXISTS vizai_scans (
       scan_id UUID PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL,
@@ -178,10 +184,13 @@ def ensure_tables_and_migrations() -> None:
       raw_llm JSONB,
 
       ip_address TEXT,
-      user_agent TEXT,
-
-      email_sent BOOLEAN DEFAULT FALSE
+      user_agent TEXT
     );
+    """
+
+    ddl_migrate = """
+    ALTER TABLE vizai_scans
+      ADD COLUMN IF NOT EXISTS email_sent BOOLEAN DEFAULT FALSE;
 
     CREATE INDEX IF NOT EXISTS idx_vizai_scans_created_at ON vizai_scans(created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_vizai_scans_contact_email ON vizai_scans(contact_email);
@@ -193,16 +202,17 @@ def ensure_tables_and_migrations() -> None:
     try:
         conn = get_db_conn()
         if not conn:
+            logger.warning("DB not available during ensure_tables; skipping")
             return
         conn.autocommit = True
         with conn.cursor() as cur:
-            cur.execute(ddl)
-        logger.info("DB ensured + indexes ready")
-    except Exception:
-        logger.exception("Failed ensuring tables/migrations")
+            cur.execute(ddl_create)
+            cur.execute(ddl_migrate)
+        logger.info("DB ensured + migrations applied")
+    except Exception as e:
+        logger.exception("Failed ensuring tables/migrations: %s", e)
     finally:
         return_db_conn(conn)
-
 
 def insert_scan(
     *,
@@ -210,7 +220,7 @@ def insert_scan(
     created_at: datetime,
     request_obj: ScanRequest,
     result: ScanResponse,
-    raw_bundle: Optional[Dict[str, Any]],
+    raw_llm: Optional[Dict[str, Any]],
     ip_address: Optional[str],
     user_agent: Optional[str],
     email_sent: bool,
@@ -232,11 +242,14 @@ def insert_scan(
       %s, %s, %s, %s, %s
     );
     """
+
     conn = None
     try:
         conn = get_db_conn()
         if not conn:
+            logger.warning("DB unavailable; scan not stored")
             return False
+
         with conn.cursor() as cur:
             cur.execute(
                 sql,
@@ -247,24 +260,28 @@ def insert_scan(
                     str(request_obj.website),
                     str(request_obj.contactEmail),
                     bool(request_obj.requestContact),
+
                     int(result.discovery_score),
                     int(result.accuracy_score),
                     int(result.authority_score),
                     int(result.overall_score),
+
                     result.package_recommendation,
                     result.package_explanation,
                     result.strategy_summary,
+
                     Json(result.findings),
-                    Json(raw_bundle) if raw_bundle is not None else None,
+                    Json(raw_llm) if raw_llm is not None else None,
                     ip_address,
                     user_agent,
                     bool(email_sent),
                 ),
             )
         conn.commit()
+        logger.info("Scan inserted into DB: %s", scan_id)
         return True
-    except Exception:
-        logger.exception("Failed inserting scan into DB")
+    except Exception as e:
+        logger.exception("Failed inserting scan into DB: %s", e)
         try:
             if conn:
                 conn.rollback()
@@ -275,55 +292,175 @@ def insert_scan(
         return_db_conn(conn)
 
 # -------------------------------------------------------------------
+# Package recommendation logic (shared)
+# -------------------------------------------------------------------
+
+def clamp_score(val: Any, default: int = 50) -> int:
+    try:
+        v = int(val)
+        return max(0, min(100, v))
+    except Exception:
+        return default
+
+def derive_recommendation(discovery: int, accuracy: int, authority: int):
+    overall = int(round((discovery + accuracy + authority) / 3))
+
+    if overall >= 80:
+        package = "Basic LMO"
+        explanation = (
+            "Your AI visibility is strong. Basic focuses on monitoring drift and "
+            "small adjustments so your profile stays accurate as models evolve."
+        )
+        strategy = (
+            "Lock in a canonical Truth File, validate schema/metadata, and run scheduled "
+            "rechecks to catch drift early."
+        )
+    elif overall >= 40:
+        package = "Standard LMO"
+        explanation = (
+            "Your AI profile is partially correct but has gaps or inconsistencies. "
+            "Standard is designed to close gaps and strengthen reliable signals."
+        )
+        strategy = (
+            "Fix core facts (who you are, what you do, where you operate), publish structured data, "
+            "and seed authoritative profiles so AI answers become consistently correct."
+        )
+    else:
+        package = "Standard LMO + Add-Ons"
+        explanation = (
+            "AI currently has a weak or fragmented view of your business. "
+            "You’ll need deeper correction plus targeted add-ons to build trust and discoverability."
+        )
+        strategy = (
+            "Start with a Truth File + schema deployment, then layer add-ons like authority seeding "
+            "and competitor comparisons to correct the record quickly."
+        )
+
+    return overall, package, explanation, strategy
+
+# -------------------------------------------------------------------
+# OpenAI fallback analysis (honest estimation)
+# -------------------------------------------------------------------
+
+def run_openai_estimate(business_name: str, website: str, models: List[str]):
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not configured on the server.")
+
+    models_str = ", ".join(models) if models else "default"
+
+    prompt = f"""
+You are VizAI Scan, an LMO-style business visibility diagnostic.
+
+Business name: {business_name}
+Website: {website}
+Models (informational only): {models_str}
+
+CONSTRAINTS:
+- You are making an ESTIMATION based on the business name + domain only.
+- You have NOT browsed the web or tested actual AI tools.
+- You have NOT crawled the website.
+- Be conservative and realistic in scores.
+- Findings should be actionable best-practice recommendations, not specific claims.
+
+Return a single JSON object with EXACTLY this structure:
+
+{{
+  "discovery_score": <integer 0-100>,
+  "accuracy_score": <integer 0-100>,
+  "authority_score": <integer 0-100>,
+  "findings": [
+    "<actionable recommendation about discovery>",
+    "<actionable recommendation about accuracy>",
+    "<actionable recommendation about authority>",
+    "<optional additional insight>"
+  ]
+}}
+
+Return ONLY JSON.
+""".strip()
+
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {"role": "system", "content": "You respond only with valid JSON. Be conservative and honest."},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.6,
+    }
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=40,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        logger.exception("OpenAI request failed: %s", e)
+        raise HTTPException(status_code=503, detail="AI service temporarily unavailable")
+
+    try:
+        data = resp.json()
+        content = data["choices"][0]["message"]["content"]
+        parsed = json.loads(content)
+    except Exception as e:
+        logger.exception("Failed to parse OpenAI response: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to process AI analysis")
+
+    discovery = clamp_score(parsed.get("discovery_score"), 50)
+    accuracy = clamp_score(parsed.get("accuracy_score"), 50)
+    authority = clamp_score(parsed.get("authority_score"), 50)
+
+    findings = parsed.get("findings", ["Analysis complete. Contact us for a full audit."])
+    if not isinstance(findings, list):
+        findings = [str(findings)]
+    findings = [str(f)[:220] for f in findings][:6]
+
+    overall, package, explanation, strategy = derive_recommendation(discovery, accuracy, authority)
+
+    result = ScanResponse(
+        discovery_score=discovery,
+        accuracy_score=accuracy,
+        authority_score=authority,
+        overall_score=overall,
+        package_recommendation=package,
+        package_explanation=explanation,
+        strategy_summary=strategy,
+        findings=findings,
+    )
+
+    # Make the fallback disclaimer explicit
+    result.disclaimer = (
+        "Fallback mode: this scan is an AI-assisted estimate based on your business name and domain only. "
+        "It did not browse the web or capture citations."
+    )
+
+    return result, parsed
+
+# -------------------------------------------------------------------
 # Email (Resend)
 # -------------------------------------------------------------------
 
 def resend_send_email(*, to_email: str, subject: str, text: str) -> bool:
     if not RESEND_API_KEY or not NOTIFY_EMAIL_FROM:
         return False
+
     headers = {"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"}
     data = {"from": NOTIFY_EMAIL_FROM, "to": [to_email], "subject": subject, "text": text}
+
     try:
-        r = requests.post("https://api.resend.com/emails", headers=headers, json=data, timeout=20)
-        r.raise_for_status()
+        resp = requests.post("https://api.resend.com/emails", headers=headers, json=data, timeout=20)
+        resp.raise_for_status()
         return True
-    except Exception:
-        logger.exception("Resend send failed")
+    except Exception as e:
+        logger.exception("Resend send failed: %s", e)
         return False
 
-
-def format_report_text(req: ScanRequest, res: ScanResponse) -> str:
+def format_customer_report(req: ScanRequest, res: ScanResponse) -> str:
     findings_block = "\n".join(f"• {line}" for line in res.findings)
-
-    rec_block = ""
-    if res.recommendations:
-        fix_now = res.recommendations.get("fix_now") or []
-        maintain = res.recommendations.get("maintain") or []
-        focus = res.recommendations.get("next_scan_focus") or []
-
-        def fmt(items):
-            out = []
-            for r in items[:5]:
-                out.append(f"- {r.get('title')} ({r.get('priority')})")
-                steps = r.get("action_steps") or []
-                for s in steps[:3]:
-                    out.append(f"    • {s}")
-            return "\n".join(out)
-
-        rec_block = f"""
-
-RECOMMENDATIONS (Evidence → Actions)
-==================================================
-Fix now:
-{fmt(fix_now) if fix_now else "- None"}
-
-Maintain:
-{fmt(maintain) if maintain else "- None"}
-
-Next scan focus:
-{', '.join(focus) if focus else 'None'}
-""".rstrip()
-
     return f"""
 VizAI Scan Report
 ==================================================
@@ -345,14 +482,19 @@ Strategy summary:
 
 Key findings:
 {findings_block}
-{rec_block}
 
 Note:
 {res.disclaimer}
+
+Reply to this email if you’d like a full multi-source audit + ongoing monitoring.
 """.strip()
 
+def send_user_report(req: ScanRequest, res: ScanResponse) -> bool:
+    subject = f"Your VizAI Scan Report: {req.businessName} ({res.overall_score}/100)"
+    body = format_customer_report(req, res)
+    return resend_send_email(to_email=str(req.contactEmail), subject=subject, text=body)
 
-def send_admin_notification(req: ScanRequest, res: ScanResponse) -> bool:
+def send_admin_notification(req: ScanRequest, res: ScanResponse, scan_id: str) -> bool:
     if not EMAIL_NOTIFICATIONS_ENABLED:
         return False
 
@@ -360,20 +502,125 @@ def send_admin_notification(req: ScanRequest, res: ScanResponse) -> bool:
     body = f"""
 New VizAI scan submitted.
 
+Scan ID: {scan_id}
 Business: {req.businessName}
 Website: {req.website}
 Contact Email: {req.contactEmail}
 Request Contact: {"YES" if req.requestContact else "no"}
 
-Scores: D={res.discovery_score} A={res.accuracy_score} Au={res.authority_score} Overall={res.overall_score}
+Scores
+- Discovery: {res.discovery_score}
+- Accuracy: {res.accuracy_score}
+- Authority: {res.authority_score}
+- Overall: {res.overall_score}
+
 Package: {res.package_recommendation}
+
+Findings:
+{chr(10).join("- " + f for f in res.findings)}
 """.strip()
+
     return resend_send_email(to_email=NOTIFY_EMAIL_TO, subject=subject, text=body)
 
+# -------------------------------------------------------------------
+# Operator Report (PRIVATE to admin)
+# -------------------------------------------------------------------
 
-def send_user_report(req: ScanRequest, res: ScanResponse) -> bool:
-    subject = f"Your VizAI Scan Report: {req.businessName} ({res.overall_score}/100)"
-    return resend_send_email(to_email=str(req.contactEmail), subject=subject, text=format_report_text(req, res))
+def format_operator_report(req: ScanRequest, raw_bundle: Dict[str, Any], scan_id: str) -> str:
+    scores = raw_bundle.get("scores", {}) or {}
+    metrics = raw_bundle.get("metrics", {}) or {}
+
+    # recommendations may be stored at raw_bundle["recommendations"] or in metrics["recommendations"]
+    recs = raw_bundle.get("recommendations")
+    if not recs:
+        recs = (metrics.get("recommendations") if isinstance(metrics, dict) else None) or {}
+
+    runs = raw_bundle.get("runs", []) or []
+    uniq_domains = metrics.get("unique_citation_domains") or []
+    freshest_days = metrics.get("freshest_cited_days")
+
+    def _fmt_recs(section: str) -> str:
+        items = recs.get(section) if isinstance(recs, dict) else None
+        if not items:
+            return "- (none)"
+        out: List[str] = []
+        for r in items[:10]:
+            title = r.get("title", "(untitled)")
+            priority = r.get("priority", "medium")
+            out.append(f"- {title} [{priority}]")
+            steps = r.get("action_steps") or []
+            for s in steps[:6]:
+                out.append(f"    • {s}")
+            why = r.get("why") or []
+            if why:
+                out.append(f"    Why: {' | '.join(why[:3])}")
+            meas = r.get("measurable_outcome")
+            if meas:
+                out.append(f"    Measure: {meas}")
+            out.append("")
+        return "\n".join(out).strip()
+
+    next_focus = recs.get("next_scan_focus") if isinstance(recs, dict) else None
+    next_focus_line = ", ".join(next_focus) if isinstance(next_focus, list) and next_focus else "(none)"
+
+    run_lines = []
+    for r in runs:
+        pn = r.get("prompt_name")
+        c = r.get("search_results") or []
+        run_lines.append(f"- {pn}: {len(c)} citations")
+
+    domains_preview = ", ".join(uniq_domains[:12]) + (" ..." if len(uniq_domains) > 12 else "")
+
+    return f"""
+VIZAI OPERATOR REPORT (PRIVATE)
+==================================================
+
+Scan ID: {scan_id}
+Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}
+
+Business: {req.businessName}
+Website: {req.website}
+Contact Email: {req.contactEmail}
+Contact Requested: {"YES" if req.requestContact else "no"}
+
+SCORES
+--------------------------------------------------
+Discovery:  {scores.get("discovery")}
+Accuracy:   {scores.get("accuracy")}
+Authority:  {scores.get("authority")}
+Overall:    {scores.get("overall")}
+
+EVIDENCE SUMMARY
+--------------------------------------------------
+Official cited: {metrics.get("cites_official_domain")}
+Unique domains: {len(uniq_domains)}  ({domains_preview})
+Freshest cited source: {freshest_days if freshest_days is not None else "unknown"} days
+Mentions name: {metrics.get("mentions_business_name")}
+Mentions official domain: {metrics.get("mentions_official_domain")}
+
+RECOMMENDATIONS (FIX NOW)
+--------------------------------------------------
+{_fmt_recs("fix_now")}
+
+RECOMMENDATIONS (MAINTAIN)
+--------------------------------------------------
+{_fmt_recs("maintain")}
+
+NEXT SCAN FOCUS
+--------------------------------------------------
+{next_focus_line}
+
+RUNS / CITATIONS
+--------------------------------------------------
+{chr(10).join(run_lines) if run_lines else "- (none)"}
+""".strip()
+
+def send_operator_report(req: ScanRequest, raw_bundle: Dict[str, Any], scan_id: str) -> bool:
+    if not EMAIL_NOTIFICATIONS_ENABLED:
+        return False
+    subject = f"[VizAI OPERATOR] {req.businessName} ({raw_bundle.get('scores', {}).get('overall', 'n/a')}/100)"
+    body = format_operator_report(req, raw_bundle, scan_id)
+    return resend_send_email(to_email=NOTIFY_EMAIL_TO, subject=subject, text=body)
 
 # -------------------------------------------------------------------
 # Startup / Shutdown
@@ -387,7 +634,6 @@ def on_startup():
         ensure_tables_and_migrations()
     logger.info("VizAI startup complete")
 
-
 @app.on_event("shutdown")
 def on_shutdown():
     global _db_pool
@@ -395,9 +641,10 @@ def on_shutdown():
     if _db_pool:
         try:
             _db_pool.closeall()
-        except Exception:
-            logger.exception("Error closing DB pool")
-    _db_pool = None
+            logger.info("DB pool closed")
+        except Exception as e:
+            logger.exception("Error closing DB pool: %s", e)
+        _db_pool = None
 
 # -------------------------------------------------------------------
 # Routes
@@ -405,25 +652,57 @@ def on_shutdown():
 
 @app.get("/")
 def root():
-    return {"status": "ok", "service": "VizAI Scan API", "version": "2.0.0"}
-
-
-@app.get("/health")
-def health():
     return {
-        "status": "healthy",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "services": {
-            "api": "operational",
-            "database": "operational" if DATABASE_URL else "not_configured",
-            "email": "operational" if EMAIL_NOTIFICATIONS_ENABLED else "not_configured",
+        "status": "ok",
+        "service": "VizAI Scan API",
+        "version": "1.3.0",
+        "endpoints": {
+            "scan": "/run_scan",
+            "health": "/health",
+            "docs": "/docs",
+            "scan_by_id": "/scan/{scan_id}",
+            "admin_stats": "/admin/stats",
+            "test_email": "/test_email",
         },
     }
 
+@app.get("/health")
+def health():
+    services = {
+        "api": "operational",
+        "database": "not_configured" if not DATABASE_URL else "unknown",
+        "email": "operational" if EMAIL_NOTIFICATIONS_ENABLED else "not_configured",
+        "perplexity": "operational" if PERPLEXITY_API_KEY else "not_configured",
+        "openai_fallback": "operational" if OPENAI_API_KEY else "not_configured",
+    }
+
+    if DATABASE_URL:
+        conn = None
+        try:
+            conn = get_db_conn()
+            if conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                services["database"] = "operational"
+            else:
+                services["database"] = "unavailable"
+        except Exception:
+            services["database"] = "error"
+        finally:
+            return_db_conn(conn)
+
+    return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat(), "services": services}
 
 @app.post("/run_scan", response_model=ScanResponse)
 def run_scan(payload: ScanRequest, request: Request):
-    # request context
+    """
+    Main endpoint used by the VizAI frontend:
+    - Real scan (Perplexity web-backed) by default
+    - Honest fallback (OpenAI estimation) if Real scan fails
+    - Stores raw evidence bundle in Postgres (best-effort)
+    - Emails: admin notification + user report + operator report (best-effort)
+    """
+    # request metadata
     client_ip = None
     try:
         forwarded = request.headers.get("X-Forwarded-For")
@@ -433,56 +712,87 @@ def run_scan(payload: ScanRequest, request: Request):
             client_ip = request.client.host
     except Exception:
         client_ip = None
-    user_agent = request.headers.get("user-agent")
 
+    user_agent = request.headers.get("user-agent")
     logger.info("Scan started: business=%s ip=%s", payload.businessName, client_ip)
 
-    # run real scan engine
+    scan_id = uuid.uuid4()
+    created_at = datetime.now(timezone.utc)
+
+    raw_llm: Optional[Dict[str, Any]] = None
+
+    # Try real scan first
     try:
         from scan_engine_real import run_real_scan_perplexity
+
         real_result, raw_bundle = run_real_scan_perplexity(
             business_name=payload.businessName,
             website=str(payload.website),
         )
+
+        result = ScanResponse(
+            discovery_score=int(real_result.discovery_score),
+            accuracy_score=int(real_result.accuracy_score),
+            authority_score=int(real_result.authority_score),
+            overall_score=int(real_result.overall_score),
+            package_recommendation=str(real_result.package_recommendation),
+            package_explanation=str(real_result.package_explanation),
+            strategy_summary=str(real_result.strategy_summary),
+            findings=list(real_result.findings or []),
+        )
+
+        # Set a clear disclaimer for real scan mode
+        result.disclaimer = (
+            "Real Scan mode: this report is based on web-backed answers and captured citations "
+            "(stored for audit and comparison)."
+        )
+
+        raw_llm = raw_bundle
+
     except Exception as e:
-        logger.exception("Real scan engine failed: %s", e)
-        raise HTTPException(status_code=503, detail="Scan engine unavailable. Please try again.")
+        # Fallback to honest OpenAI estimate (if configured)
+        logger.exception("Real scan failed; falling back to OpenAI estimate: %s", e)
+        result, parsed = run_openai_estimate(
+            business_name=payload.businessName,
+            website=str(payload.website),
+            models=payload.models,
+        )
+        raw_llm = {
+            "engine": "openai_estimate_fallback",
+            "model": OPENAI_MODEL,
+            "parsed": parsed,
+            "error_from_real_scan": str(e),
+        }
 
-    # map to API response
-    result = ScanResponse(
-        discovery_score=int(real_result.discovery_score),
-        accuracy_score=int(real_result.accuracy_score),
-        authority_score=int(real_result.authority_score),
-        overall_score=int(real_result.overall_score),
-        package_recommendation=str(real_result.package_recommendation),
-        package_explanation=str(real_result.package_explanation),
-        strategy_summary=str(real_result.strategy_summary),
-        findings=list(real_result.findings or []),
-        recommendations=(raw_bundle.get("recommendations") if isinstance(raw_bundle, dict) else None),
-    )
-
-    # metadata
-    scan_id = uuid.uuid4()
-    created_at = datetime.now(timezone.utc)
+    # attach metadata
     result.scan_id = str(scan_id)
     result.created_at = created_at.isoformat()
 
-    # emails (best-effort)
+    # Emails (best-effort)
     email_sent = False
     try:
         if EMAIL_NOTIFICATIONS_ENABLED:
             try:
-                send_admin_notification(payload, result)
+                send_admin_notification(payload, result, result.scan_id)
             except Exception:
                 logger.exception("Admin email failed (non-fatal)")
+
             try:
                 email_sent = send_user_report(payload, result)
             except Exception:
                 logger.exception("User email failed (non-fatal)")
+
+            # Operator report (only if we have a real raw bundle with evidence/recs)
+            try:
+                if isinstance(raw_llm, dict) and raw_llm.get("engine", "").startswith("real_"):
+                    send_operator_report(payload, raw_llm, result.scan_id)
+            except Exception:
+                logger.exception("Operator report email failed (non-fatal)")
         else:
-            logger.info("Email not configured; skipping send")
+            logger.info("Email not configured; skipping sends")
     except Exception:
         logger.exception("Email block failed (non-fatal)")
+
     result.email_sent = bool(email_sent)
 
     # DB insert (best-effort)
@@ -493,7 +803,7 @@ def run_scan(payload: ScanRequest, request: Request):
                 created_at=created_at,
                 request_obj=payload,
                 result=result,
-                raw_bundle=raw_bundle if isinstance(raw_bundle, dict) else None,
+                raw_llm=raw_llm,
                 ip_address=client_ip,
                 user_agent=user_agent,
                 email_sent=bool(email_sent),
@@ -504,6 +814,182 @@ def run_scan(payload: ScanRequest, request: Request):
     logger.info("Scan complete: scan_id=%s overall=%s", scan_id, result.overall_score)
     return result
 
+@app.get("/scan/{scan_id}")
+def get_scan(scan_id: str):
+    if not DATABASE_URL:
+        raise HTTPException(status_code=501, detail="Database not configured")
+
+    try:
+        scan_uuid = uuid.UUID(scan_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid scan ID format")
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    scan_id, created_at, business_name, website,
+                    contact_email, request_contact,
+                    discovery_score, accuracy_score, authority_score, overall_score,
+                    package_recommendation, package_explanation, strategy_summary,
+                    findings, email_sent
+                FROM vizai_scans
+                WHERE scan_id = %s
+                """,
+                (str(scan_uuid),),
+            )
+            row = cur.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Scan not found")
+
+        return {
+            "scan_id": str(row[0]),
+            "created_at": row[1].isoformat() if row[1] else None,
+            "business_name": row[2],
+            "website": row[3],
+            "contact_email": row[4],
+            "request_contact": bool(row[5]),
+            "discovery_score": row[6],
+            "accuracy_score": row[7],
+            "authority_score": row[8],
+            "overall_score": row[9],
+            "package_recommendation": row[10],
+            "package_explanation": row[11],
+            "strategy_summary": row[12],
+            "findings": row[13],
+            "email_sent": bool(row[14]) if row[14] is not None else None,
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to retrieve scan: %s", scan_id)
+        raise HTTPException(status_code=500, detail="Failed to retrieve scan")
+    finally:
+        return_db_conn(conn)
+
+@app.get("/admin/stats")
+def admin_stats():
+    if not DATABASE_URL:
+        return {"error": "Database not configured", "stats": None}
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        if not conn:
+            raise HTTPException(status_code=503, detail="Database unavailable")
+
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM vizai_scans")
+            total_scans = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(AVG(discovery_score),0)::int,
+                    COALESCE(AVG(accuracy_score),0)::int,
+                    COALESCE(AVG(authority_score),0)::int,
+                    COALESCE(AVG(overall_score),0)::int
+                FROM vizai_scans
+                """
+            )
+            avg = cur.fetchone()
+
+            cur.execute("SELECT COUNT(*) FROM vizai_scans WHERE request_contact = true")
+            contact_requests = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM vizai_scans
+                WHERE created_at > NOW() - INTERVAL '24 hours'
+                """
+            )
+            recent_24h = cur.fetchone()[0]
+
+            cur.execute(
+                """
+                SELECT package_recommendation, COUNT(*)
+                FROM vizai_scans
+                GROUP BY package_recommendation
+                """
+            )
+            pkg_dist = dict(cur.fetchall())
+
+        conversion = round((contact_requests / total_scans) * 100, 1) if total_scans else 0.0
+
+        return {
+            "total_scans": total_scans,
+            "recent_24h": recent_24h,
+            "contact_requests": contact_requests,
+            "conversion_rate": conversion,
+            "average_scores": {
+                "discovery": avg[0],
+                "accuracy": avg[1],
+                "authority": avg[2],
+                "overall": avg[3],
+            },
+            "package_distribution": pkg_dist,
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to compute admin stats")
+        raise HTTPException(status_code=500, detail="Failed to retrieve statistics")
+    finally:
+        return_db_conn(conn)
+
+@app.post("/test_email")
+def test_email():
+    if not EMAIL_NOTIFICATIONS_ENABLED:
+        return {"status": "notifications_not_configured"}
+
+    dummy_req = ScanRequest(
+        businessName="Test Business",
+        website="https://example.com",
+        contactEmail=NOTIFY_EMAIL_TO,  # send to admin for test
+        requestContact=True,
+        models=["default"],
+    )
+
+    dummy_res = ScanResponse(
+        scan_id=str(uuid.uuid4()),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        discovery_score=70,
+        accuracy_score=65,
+        authority_score=60,
+        overall_score=65,
+        package_recommendation="Standard LMO",
+        package_explanation="Test email – standard tier.",
+        strategy_summary="This is a test email from VizAI backend.",
+        findings=["This is a test finding from /test_email."],
+    )
+
+    admin_sent = send_admin_notification(dummy_req, dummy_res, dummy_res.scan_id)
+    user_sent = send_user_report(dummy_req, dummy_res)
+
+    # Operator test
+    operator_sent = resend_send_email(
+        to_email=NOTIFY_EMAIL_TO,
+        subject="[VizAI OPERATOR] Test Operator Report",
+        text="If you received this, operator email sending is functional.",
+    )
+
+    return {
+        "status": "ok",
+        "admin_sent": bool(admin_sent),
+        "user_sent": bool(user_sent),
+        "operator_sent": bool(operator_sent),
+    }
+
+# -------------------------------------------------------------------
+# Error Handlers
+# -------------------------------------------------------------------
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -512,11 +998,18 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         content={"error": exc.detail, "status_code": exc.status_code, "path": str(request.url)},
     )
 
-
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled exception: %s", exc)
-    return JSONResponse(status_code=500, content={"error": "Internal server error"})
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error", "message": "Unexpected error occurred."},
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
 
 
 
