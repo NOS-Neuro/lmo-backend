@@ -390,13 +390,40 @@ def run_real_scan_perplexity(
     findings: List[str] = []
     findings.append("Real scan: web-backed answers + citations captured for auditability.")
     findings.append(f"Official site cited: {'yes' if cites_official else 'no'}")
-    findings.append(f"Unique citation domains: {len(uniq_domains)}")
-    if freshest_days is not None:
-    findings.append(f"Freshest cited source: ~{freshest_days} days old")
+
+# Discovery/authority specifics
+    if len(uniq_domains) <= 4:
+    findings.append(f"Authority footprint is narrow: only {len(uniq_domains)} unique citation domains.")
+    elif len(uniq_domains) >= 10:
+    findings.append(f"Authority footprint is strong: {len(uniq_domains)} unique citation domains.")
     else:
-    findings.append("Freshness: citation dates not provided by sources")
-    findings.append(f"Comprehensiveness signals: {comprehensiveness_hits}/3 (services/location/contact)")
-    findings.append("Score ceiling: categories max 95; overall max 92 (prevents perfect-score inflation).")
+    findings.append(f"Authority footprint: {len(uniq_domains)} unique citation domains.")
+
+# Freshness specifics
+    if freshest_days is None:
+    findings.append("Freshness: citation dates were not provided by sources (hard to prove recency).")
+    elif freshest_days <= 30:
+    findings.append(f"Freshness looks good: newest cited source is ~{freshest_days} days old.")
+    elif freshest_days <= 90:
+    findings.append(f"Freshness is moderate: newest cited source is ~{freshest_days} days old.")
+    else:
+    findings.append(f"Freshness is stale: newest cited source is ~{freshest_days} days old.")
+
+# Coverage specifics
+    coverage_bits = []
+    if has_services:
+    coverage_bits.append("services")
+    if has_location:
+    coverage_bits.append("location")
+    if has_contact:
+    coverage_bits.append("contact")
+
+    if comprehensiveness_hits == 3:
+    findings.append("Coverage signals are complete: services, location, and contact all surfaced in answers.")
+    else:
+    missing = [x for x in ["services", "location", "contact"] if x not in coverage_bits]
+    findings.append(f"Coverage gaps detected: missing/unclear {', '.join(missing)} in answers.")
+
 
     
     metrics = {
