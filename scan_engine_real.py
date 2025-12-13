@@ -396,8 +396,7 @@ def run_real_scan_perplexity(
     else:
         findings.append("Freshness: citation dates not provided by sources")
     findings.append(f"Comprehensiveness signals: {comprehensiveness_hits}/3 (services/location/contact)")
-    findings.append("Score ceiling: categories max 95; overall max 92 (prevents perfect-score inflation).")
-
+    
     metrics = {
         "engine": raw_bundle["engine"],
         "provider": "perplexity",
