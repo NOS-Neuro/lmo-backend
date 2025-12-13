@@ -242,7 +242,9 @@ def root():
 @app.post("/run_scan", response_model=ScanResponse)
 def run_scan(payload: ScanRequest, request: Request):
 
-    # request metadata (hardened for Render / proxies)
+    # -------------------------
+    # request metadata (Render/proxies safe)
+    # -------------------------
     client_ip = None
     try:
         forwarded = request.headers.get("x-forwarded-for")
@@ -262,6 +264,9 @@ def run_scan(payload: ScanRequest, request: Request):
 
     user_agent = request.headers.get("user-agent")
 
+    # -------------------------
+    # scan
+    # -------------------------
     from scan_engine_real import run_real_scan_perplexity
 
     scan_id = uuid.uuid4()
@@ -275,7 +280,45 @@ def run_scan(payload: ScanRequest, request: Request):
             website=str(payload.website),
         )
         raw_llm = raw_bundle
-        ...
+
+        result = ScanResponse(
+            scan_id=str(scan_id),
+            created_at=created_at.isoformat(),
+            discovery_score=int(result_obj.discovery_score),
+            accuracy_score=int(result_obj.accuracy_score),
+            authority_score=int(result_obj.authority_score),
+            overall_score=int(result_obj.overall_score),
+            package_recommendation=str(result_obj.package_recommendation),
+            package_explanation=str(result_obj.package_explanation),
+            strategy_summary=str(result_obj.strategy_summary),
+            findings=list(result_obj.findings or []),
+            email_sent=False,
+        )
+
+    except Exception as e:
+        logger.exception("Real scan failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    # -------------------------
+    # store scan (best-effort)
+    # -------------------------
+    try:
+        if DATABASE_URL:
+            insert_scan(
+                scan_id=scan_id,
+                created_at=created_at,
+                request_obj=payload,
+                result=result,
+                raw_llm=raw_llm,
+                ip_address=client_ip,
+                user_agent=user_agent,
+                email_sent=bool(result.email_sent),
+            )
+    except Exception as e:
+        logger.exception("DB insert failed (non-fatal): %s", e)
+
+    return result
+
 
     # -----------------------
     # Store main scan
