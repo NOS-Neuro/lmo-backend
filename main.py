@@ -83,6 +83,11 @@ class CompetitorIn(BaseModel):
         return v
 
 
+class QuestionIn(BaseModel):
+    prompt_name: str
+    question: str
+
+
 class ScanRequest(BaseModel):
     businessName: str
     website: HttpUrl
@@ -90,6 +95,7 @@ class ScanRequest(BaseModel):
     requestContact: bool = False
     models: List[str] = []
     competitors: List[CompetitorIn] = []
+    questions: List[QuestionIn] = []
 
     @field_validator("businessName")
     @classmethod
@@ -446,10 +452,15 @@ def run_scan(payload: ScanRequest, request: Request):
 
     # Main scan (real scan only for now)
     try:
+        custom_questions = None
+        if payload.questions:
+            custom_questions = [(q.prompt_name, q.question) for q in payload.questions]
+
         result_obj, raw_bundle = run_real_scan_perplexity(
             business_name=payload.businessName,
             website=str(payload.website),
             competitors=[{"name": c.name, "website": str(c.website)} for c in (payload.competitors or [])],
+            questions=custom_questions,
         )
         raw_llm = raw_bundle
 

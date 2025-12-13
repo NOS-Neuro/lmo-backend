@@ -24,6 +24,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from core.prompts import DEFAULT_QUESTIONS
+
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 PERPLEXITY_MODEL = os.getenv("PERPLEXITY_MODEL", "sonar-pro")
 PERPLEXITY_TIMEOUT = int(os.getenv("PERPLEXITY_TIMEOUT", "45"))
@@ -224,13 +226,6 @@ class PerplexityClient:
 # Scan prompts
 # -----------------------------
 
-DEFAULT_QUESTIONS: List[Tuple[str, str]] = [
-    ("baseline_overview", "In 3–6 bullets: what does this company do? Include official site + main services."),
-    ("contact_path", "What is the best contact path (email/form/phone) from sources? If unknown, say unclear."),
-    ("locations_scope", "Where does the company operate (regions/countries)? If unclear, say unclear."),
-    ("proof_points", "List 3 proof points from sources (certifications, customers, industries, capabilities)."),
-]
-
 AUTHORITY_DOMAIN_BONUS = {
     "wikipedia.org": 10,
     "linkedin.com": 6,
@@ -292,6 +287,7 @@ def run_real_scan_perplexity(
     *,
     business_name: str,
     website: str,
+    competitors: Optional[List[Dict[str, Any]]] = None,
     questions: Optional[List[Tuple[str, str]]] = None,
 ) -> Tuple[RealScanResult, Dict[str, Any]]:
 
