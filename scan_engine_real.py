@@ -14,7 +14,6 @@ Honesty:
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,10 +23,7 @@ from urllib.parse import urlparse
 import requests
 
 from core.prompts import DEFAULT_QUESTIONS
-
-PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
-PERPLEXITY_MODEL = os.getenv("PERPLEXITY_MODEL", "sonar-pro")
-PERPLEXITY_TIMEOUT = int(os.getenv("PERPLEXITY_TIMEOUT", "45"))
+from config import settings
 
 
 # -----------------------------
@@ -262,9 +258,9 @@ def run_real_scan_perplexity(
     """
 
     client = PerplexityClient(
-        api_key=PERPLEXITY_API_KEY,
-        model=PERPLEXITY_MODEL,
-        timeout=PERPLEXITY_TIMEOUT,
+        api_key=settings.PERPLEXITY_API_KEY,
+        model=settings.PERPLEXITY_MODEL,
+        timeout=settings.PERPLEXITY_TIMEOUT,
     )
 
     biz_domain = _domain(website)
@@ -274,7 +270,7 @@ def run_real_scan_perplexity(
     raw_bundle: Dict[str, Any] = {
         "engine": "real_perplexity_mvp_v3",
         "provider": "perplexity",
-        "model": PERPLEXITY_MODEL,
+        "model": settings.PERPLEXITY_MODEL,
         "runs": [],
         "notes": [
             "Discovery/Authority are evidence-based from returned citations.",
@@ -305,7 +301,7 @@ def run_real_scan_perplexity(
         provider_results.append(
             ProviderResult(
                 provider="perplexity",
-                model=PERPLEXITY_MODEL,
+                model=settings.PERPLEXITY_MODEL,
                 prompt_name=prompt_name,
                 question=q,
                 answer_text=answer,
@@ -403,7 +399,7 @@ def run_real_scan_perplexity(
     metrics: Dict[str, Any] = {
         "engine": raw_bundle["engine"],
         "provider": "perplexity",
-        "model": PERPLEXITY_MODEL,
+        "model": settings.PERPLEXITY_MODEL,
         "business_domain": biz_domain,
         "mentions_business_name": bool(mentions_name),
         "mentions_official_domain": bool(mentions_domain),
