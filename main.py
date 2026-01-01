@@ -404,9 +404,12 @@ async def add_request_id_middleware(request: Request, call_next):
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.FRONTEND_ORIGIN],
+    allow_origins=[
+        settings.FRONTEND_ORIGIN,   # your Vercel URL or custom domain
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
-    allow_methods=["GET", "POST"],
+    allow_methods=["*"],          # <-- includes OPTIONS (fixes preflight)
     allow_headers=["*"],
 )
 
