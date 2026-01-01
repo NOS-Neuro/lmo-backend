@@ -12,10 +12,10 @@ from pydantic import Field, field_validator
 class Settings(BaseSettings):
     """Application settings with validation."""
 
-    # Required settings
-    PERPLEXITY_API_KEY: str = Field(
-        ...,
-        description="Perplexity API key for web search (required)"
+    # API Keys (at least one required for scanning)
+    PERPLEXITY_API_KEY: Optional[str] = Field(
+        default=None,
+        description="Perplexity API key for web search (primary provider)"
     )
 
     # Optional AI settings
