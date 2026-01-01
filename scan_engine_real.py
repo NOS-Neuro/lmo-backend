@@ -23,10 +23,7 @@ from urllib.parse import urlparse
 
 import requests
 
-feature/custom-questions-15175629877790877784
 from core.prompts import DEFAULT_QUESTIONS
-
-main
 
 PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
 PERPLEXITY_MODEL = os.getenv("PERPLEXITY_MODEL", "sonar-pro")
@@ -109,7 +106,7 @@ def _contains_name(answer: str, business_name: str) -> bool:
 
 def _unique(seq: List[str]) -> List[str]:
     seen = set()
-    out = []
+    out: List[str] = []
     for x in seq:
         if x and x not in seen:
             seen.add(x)
@@ -141,7 +138,7 @@ def derive_recommendation(discovery: int, accuracy: int, authority: int) -> Tupl
     if overall >= 80:
         package = "Basic LMO"
         explanation = (
-            "You’re in a strong baseline position. Basic is about monitoring drift, "
+            "You're in a strong baseline position. Basic is about monitoring drift, "
             "tightening a few signals, and keeping answers stable as sources change."
         )
         strategy = (
@@ -161,7 +158,7 @@ def derive_recommendation(discovery: int, accuracy: int, authority: int) -> Tupl
     else:
         package = "Standard LMO + Add-Ons"
         explanation = (
-            "AI visibility is weak or fragmented. You’ll need foundational correction plus targeted "
+            "AI visibility is weak or fragmented. You'll need foundational correction plus targeted "
             "authority building to correct the record quickly."
         )
         strategy = (
@@ -256,6 +253,13 @@ def run_real_scan_perplexity(
     competitors: Optional[List[Dict[str, Any]]] = None,
     questions: Optional[List[Tuple[str, str]]] = None,
 ) -> Tuple[RealScanResult, Dict[str, Any]]:
+    """
+    Returns:
+      (RealScanResult, raw_bundle)
+
+    competitors:
+      Accepted and stored for future use, but not executed here unless you explicitly want it.
+    """
 
     client = PerplexityClient(
         api_key=PERPLEXITY_API_KEY,
@@ -276,6 +280,7 @@ def run_real_scan_perplexity(
             "Discovery/Authority are evidence-based from returned citations.",
             "Accuracy is a proxy until a Truth File compare is implemented.",
         ],
+        "competitors": competitors or [],
     }
 
     system = (
@@ -353,7 +358,7 @@ def run_real_scan_perplexity(
     comprehensiveness_hits = int(has_services) + int(has_location) + int(has_contact)
 
     # -----------------------------
-    # Deterministic scoring (then cap to avoid “perfect”)
+    # Deterministic scoring (then cap to avoid "perfect")
     # -----------------------------
     discovery = 0
     discovery += 45 if mentions_name else 0
@@ -384,7 +389,7 @@ def run_real_scan_perplexity(
     authority += _clamp_int(bonus, default=0, lo=0, hi=20)
     authority = _clamp_int(authority, default=50)
 
-    # --- Internal caps (do NOT mention in findings)
+    # Internal caps (do NOT mention in findings)
     discovery = min(discovery, 95)
     accuracy = min(accuracy, 95)
     authority = min(authority, 95)
@@ -443,7 +448,7 @@ def run_real_scan_perplexity(
         metrics["recommendations_error"] = str(e)
 
     # -----------------------------
-    # Findings (more specific / variable)
+    # Findings (specific / variable)
     # -----------------------------
     findings: List[str] = []
     findings.append("Real scan completed with web-backed answers + captured citations.")
@@ -458,7 +463,6 @@ def run_real_scan_perplexity(
     if freshest_days is None:
         findings.append("Freshness signals: citation dates not provided by sources.")
     else:
-"""
 scan_engine_real.py — VizAI Real Scan Engine (Perplexity-first, production-safe MVP)
 
 Real + measurable:
