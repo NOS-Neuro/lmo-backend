@@ -19,14 +19,35 @@ from psycopg2.extras import Json
 from config import settings
 
 # -------------------------------------------------------------------
-# Logging
+# Logging with Request Context
 # -------------------------------------------------------------------
 
+class RequestContextFilter(logging.Filter):
+    """Add request context (request_id, scan_id) to log records"""
+
+    def filter(self, record):
+        # Add request_id if not present
+        if not hasattr(record, 'request_id'):
+            record.request_id = '-'
+        if not hasattr(record, 'scan_id'):
+            record.scan_id = '-'
+        return True
+
+
+# Configure logging with structured format
 logging.basicConfig(
     level=settings.LOG_LEVEL,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    format="%(asctime)s [%(levelname)s] [req:%(request_id)s] [scan:%(scan_id)s] %(name)s - %(message)s",
 )
 logger = logging.getLogger("vizai")
+logger.addFilter(RequestContextFilter())
+
+
+def log_with_context(level: str, message: str, request_id: str = "-", scan_id: str = "-", **kwargs):
+    """Log with request context for tracing"""
+    log_func = getattr(logger, level.lower())
+    log_func(message, extra={"request_id": request_id, "scan_id": scan_id}, **kwargs)
+
 
 # -------------------------------------------------------------------
 # Startup Info
@@ -365,6 +386,22 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# -------------------------------------------------------------------
+# Request ID Middleware
+# -------------------------------------------------------------------
+
+@app.middleware("http")
+async def add_request_id_middleware(request: Request, call_next):
+    """Add unique request ID to all requests for tracing"""
+    request_id = str(uuid.uuid4())[:8]  # Short ID for readability
+    request.state.request_id = request_id
+
+    # Add to response headers for client-side debugging
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[settings.FRONTEND_ORIGIN],
@@ -426,6 +463,14 @@ def health():
 @app.post("/run_scan", response_model=ScanResponse)
 @limiter.limit("10/minute")
 def run_scan(payload: ScanRequest, request: Request):
+    # Get request ID from middleware
+    request_id = getattr(request.state, "request_id", "-")
+
+    # Generate scan ID
+    scan_id = uuid.uuid4()
+    scan_id_str = str(scan_id)[:8]  # Short ID for logging
+    created_at = datetime.now(timezone.utc)
+
     # request metadata (Render/proxies safe)
     client_ip = None
     try:
@@ -454,12 +499,10 @@ def run_scan(payload: ScanRequest, request: Request):
         bool(user_agent),
         len(payload.competitors),
         len(payload.questions),
+        extra={"request_id": request_id, "scan_id": scan_id_str}
     )
 
     from scan_engine_real import run_real_scan_perplexity
-
-    scan_id = uuid.uuid4()
-    created_at = datetime.now(timezone.utc)
 
     raw_llm: Optional[Dict[str, Any]] = None
 
@@ -492,7 +535,11 @@ def run_scan(payload: ScanRequest, request: Request):
             email_sent=False,
         )
     except Exception as e:
-        logger.exception("Real scan failed: %s", e)
+        logger.exception(
+            "Real scan failed: %s",
+            e,
+            extra={"request_id": request_id, "scan_id": scan_id_str}
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
     # --- Store main scan (fail loud if DB configured)
@@ -508,7 +555,11 @@ def run_scan(payload: ScanRequest, request: Request):
                 user_agent=user_agent,
             )
         except Exception as e:
-            logger.exception("DB insert failed: %s", e)
+            logger.exception(
+                "DB insert failed: %s",
+                e,
+                extra={"request_id": request_id, "scan_id": scan_id_str}
+            )
             raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
 
         # --- Competitor baseline scans (best-effort; never break main scan)
@@ -544,8 +595,12 @@ def run_scan(payload: ScanRequest, request: Request):
 
             # Use ThreadPoolExecutor for parallel scanning
             # max_workers configurable via settings to avoid overwhelming the API
-            logger.info("Starting parallel scan of %d competitors with %d workers",
-                       len(competitors_list), settings.MAX_COMPETITOR_SCAN_WORKERS)
+            logger.info(
+                "Starting parallel scan of %d competitors with %d workers",
+                len(competitors_list),
+                settings.MAX_COMPETITOR_SCAN_WORKERS,
+                extra={"request_id": request_id, "scan_id": scan_id_str}
+            )
             with ThreadPoolExecutor(max_workers=settings.MAX_COMPETITOR_SCAN_WORKERS) as executor:
                 # Submit all competitor scans
                 future_to_competitor = {
@@ -580,7 +635,10 @@ def run_scan(payload: ScanRequest, request: Request):
                                 e
                             )
 
-            logger.info("Completed parallel competitor scanning")
+            logger.info(
+                "Completed parallel competitor scanning",
+                extra={"request_id": request_id, "scan_id": scan_id_str}
+            )
 
     return result
 
