@@ -84,6 +84,14 @@ class Settings(BaseSettings):
         description="Logging level"
     )
 
+    # Performance settings
+    MAX_COMPETITOR_SCAN_WORKERS: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum parallel workers for competitor scans (1-10)"
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

@@ -1,5 +1,6 @@
 import uuid
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import List, Optional, Any, Dict, Tuple
@@ -511,27 +512,75 @@ def run_scan(payload: ScanRequest, request: Request):
             raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
 
         # --- Competitor baseline scans (best-effort; never break main scan)
-        for c in (payload.competitors or []):
-            try:
-                comp_obj, comp_bundle = run_real_scan_perplexity(
-                    business_name=c.name,
-                    website=str(c.website),
-                )
-                insert_competitor_scan(
-                    parent_scan_id=scan_id,
-                    created_at=created_at,
-                    competitor_name=c.name,
-                    competitor_website=str(c.website),
-                    scores={
-                        "discovery": int(comp_obj.discovery_score),
-                        "accuracy": int(comp_obj.accuracy_score),
-                        "authority": int(comp_obj.authority_score),
-                        "overall": int(comp_obj.overall_score),
-                    },
-                    raw_bundle=comp_bundle,
-                )
-            except Exception as e:
-                logger.exception("Competitor scan/insert failed (non-fatal) for %s: %s", c.name, e)
+        # Run competitor scans in parallel for better performance
+        competitors_list = payload.competitors or []
+
+        if competitors_list:
+            def scan_single_competitor(competitor_data):
+                """Scan a single competitor and return results"""
+                try:
+                    comp_obj, comp_bundle = run_real_scan_perplexity(
+                        business_name=competitor_data.name,
+                        website=str(competitor_data.website),
+                    )
+                    return {
+                        "success": True,
+                        "name": competitor_data.name,
+                        "website": str(competitor_data.website),
+                        "comp_obj": comp_obj,
+                        "comp_bundle": comp_bundle,
+                    }
+                except Exception as e:
+                    logger.warning(
+                        "Competitor scan failed (non-fatal) for %s: %s",
+                        competitor_data.name,
+                        str(e)
+                    )
+                    return {
+                        "success": False,
+                        "name": competitor_data.name,
+                        "error": str(e),
+                    }
+
+            # Use ThreadPoolExecutor for parallel scanning
+            # max_workers configurable via settings to avoid overwhelming the API
+            logger.info("Starting parallel scan of %d competitors with %d workers",
+                       len(competitors_list), settings.MAX_COMPETITOR_SCAN_WORKERS)
+            with ThreadPoolExecutor(max_workers=settings.MAX_COMPETITOR_SCAN_WORKERS) as executor:
+                # Submit all competitor scans
+                future_to_competitor = {
+                    executor.submit(scan_single_competitor, comp): comp
+                    for comp in competitors_list
+                }
+
+                # Process results as they complete
+                for future in as_completed(future_to_competitor):
+                    result_data = future.result()
+
+                    if result_data["success"]:
+                        try:
+                            insert_competitor_scan(
+                                parent_scan_id=scan_id,
+                                created_at=created_at,
+                                competitor_name=result_data["name"],
+                                competitor_website=result_data["website"],
+                                scores={
+                                    "discovery": int(result_data["comp_obj"].discovery_score),
+                                    "accuracy": int(result_data["comp_obj"].accuracy_score),
+                                    "authority": int(result_data["comp_obj"].authority_score),
+                                    "overall": int(result_data["comp_obj"].overall_score),
+                                },
+                                raw_bundle=result_data["comp_bundle"],
+                            )
+                            logger.info("Successfully inserted competitor scan: %s", result_data["name"])
+                        except Exception as e:
+                            logger.exception(
+                                "Failed to insert competitor scan for %s: %s",
+                                result_data["name"],
+                                e
+                            )
+
+            logger.info("Completed parallel competitor scanning")
 
     return result
 
