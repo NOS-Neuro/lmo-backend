@@ -551,6 +551,7 @@ def get_scan_competitors(scan_id: str):
         raise HTTPException(status_code=400, detail="Invalid scan ID")
 
     conn = None
+    result = None
     try:
         conn = get_db_conn()
         if not conn:
@@ -575,7 +576,7 @@ def get_scan_competitors(scan_id: str):
             )
             rows = cur.fetchall()
 
-        return {
+        result = {
             "scan_id": scan_id,
             "count": len(rows),
             "competitors": [
@@ -595,6 +596,8 @@ def get_scan_competitors(scan_id: str):
         }
     finally:
         return_db_conn(conn)
+
+    return result
 
 
 # -------------------------------------------------------------------
