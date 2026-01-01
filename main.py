@@ -405,11 +405,12 @@ async def add_request_id_middleware(request: Request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        settings.FRONTEND_ORIGIN,   # your Vercel URL or custom domain
+        "https://www.vizai.io",
+        "https://vizai.io",
         "http://localhost:3000",
     ],
     allow_credentials=True,
-    allow_methods=["*"],          # <-- includes OPTIONS (fixes preflight)
+    allow_methods=["*"],   # includes OPTIONS (fixes preflight)
     allow_headers=["*"],
 )
 
