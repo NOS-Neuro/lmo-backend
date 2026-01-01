@@ -1,74 +1,71 @@
-import os
 import uuid
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import List, Optional, Any, Dict, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, HttpUrl, EmailStr, field_validator
+from pydantic import BaseModel, HttpUrl, EmailStr, field_validator, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from psycopg2 import pool
 from psycopg2.extras import Json
 
+from config import settings
+
 # -------------------------------------------------------------------
-# Logging
+# Logging with Request Context
 # -------------------------------------------------------------------
 
+class RequestContextFilter(logging.Filter):
+    """Add request context (request_id, scan_id) to log records"""
+
+    def filter(self, record):
+        # Add request_id if not present
+        if not hasattr(record, 'request_id'):
+            record.request_id = '-'
+        if not hasattr(record, 'scan_id'):
+            record.scan_id = '-'
+        return True
+
+
+# Configure logging with structured format
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+    level=settings.LOG_LEVEL,
+    format="%(asctime)s [%(levelname)s] [req:%(request_id)s] [scan:%(scan_id)s] %(name)s - %(message)s",
 )
 logger = logging.getLogger("vizai")
+logger.addFilter(RequestContextFilter())
+
+
+def log_with_context(level: str, message: str, request_id: str = "-", scan_id: str = "-", **kwargs):
+    """Log with request context for tracing"""
+    log_func = getattr(logger, level.lower())
+    log_func(message, extra={"request_id": request_id, "scan_id": scan_id}, **kwargs)
+
 
 # -------------------------------------------------------------------
-# Config / Environment
+# Startup Info
 # -------------------------------------------------------------------
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-PERPLEXITY_API_KEY = os.getenv("PERPLEXITY_API_KEY")
-
-RESEND_API_KEY = os.getenv("RESEND_API_KEY")
-NOTIFY_EMAIL_FROM = os.getenv("NOTIFY_EMAIL_FROM")
-NOTIFY_EMAIL_TO = os.getenv("NOTIFY_EMAIL_TO")
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-EMAIL_NOTIFICATIONS_ENABLED = bool(RESEND_API_KEY and NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO)
-FRONTEND_ORIGIN = os.getenv("FRONTEND_ORIGIN", "*")
-
-logger.info("Database storage: %s", "ENABLED" if DATABASE_URL else "DISABLED")
-logger.info("Email notifications: %s", "ENABLED" if EMAIL_NOTIFICATIONS_ENABLED else "DISABLED")
-logger.info("Perplexity real scan: %s", "READY" if PERPLEXITY_API_KEY else "NOT CONFIGURED")
-logger.info("OpenAI fallback scan: %s", "READY" if OPENAI_API_KEY else "NOT CONFIGURED")
-
-# -------------------------------------------------------------------
-# FastAPI App
-# -------------------------------------------------------------------
-
-app = FastAPI(
-    title="VizAI Scan API",
-    version="1.4.2",
-    description="VizAI: evidence-based LLM visibility scanning with competitor baselines.",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[FRONTEND_ORIGIN] if FRONTEND_ORIGIN != "*" else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+logger.info("Database storage: %s", "ENABLED" if settings.database_enabled else "DISABLED")
+logger.info("Email notifications: %s", "ENABLED" if settings.email_notifications_enabled else "DISABLED")
+logger.info("Perplexity real scan: %s", "READY" if settings.PERPLEXITY_API_KEY else "NOT CONFIGURED")
+logger.info("OpenAI fallback scan: %s", "READY" if settings.OPENAI_API_KEY else "NOT CONFIGURED")
+logger.info("CORS origin: %s", settings.FRONTEND_ORIGIN)
+logger.info("Rate limiting: ENABLED (10 req/min per IP on /run_scan)")
 
 # -------------------------------------------------------------------
 # Models
 # -------------------------------------------------------------------
 
 class CompetitorIn(BaseModel):
-    name: str
+    name: str = Field(..., min_length=2, max_length=200)
     website: HttpUrl
 
     @field_validator("name")
@@ -81,18 +78,18 @@ class CompetitorIn(BaseModel):
 
 
 class QuestionIn(BaseModel):
-    prompt_name: str
-    question: str
+    prompt_name: str = Field(..., min_length=1, max_length=100)
+    question: str = Field(..., min_length=10, max_length=1000)
 
 
 class ScanRequest(BaseModel):
-    businessName: str
+    businessName: str = Field(..., min_length=2, max_length=200)
     website: HttpUrl
     contactEmail: EmailStr
     requestContact: bool = False
-    models: List[str] = []
-    competitors: List[CompetitorIn] = []
-    questions: List[QuestionIn] = []
+    models: List[str] = Field(default=[], max_length=5)
+    competitors: List[CompetitorIn] = Field(default=[], max_length=10)
+    questions: List[QuestionIn] = Field(default=[], max_length=20)
 
     @field_validator("businessName")
     @classmethod
@@ -128,22 +125,19 @@ class ScanResponse(BaseModel):
 # DB Pool
 # -------------------------------------------------------------------
 
-DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
-DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "5"))
-
 _db_pool: Optional[pool.ThreadedConnectionPool] = None
 
 
 def init_db_pool() -> None:
     global _db_pool
-    if not DATABASE_URL or _db_pool:
+    if not settings.DATABASE_URL or _db_pool:
         return
     _db_pool = pool.ThreadedConnectionPool(
-        minconn=DB_POOL_MIN,
-        maxconn=DB_POOL_MAX,
-        dsn=DATABASE_URL,
+        minconn=settings.DB_POOL_MIN,
+        maxconn=settings.DB_POOL_MAX,
+        dsn=settings.DATABASE_URL,
     )
-    logger.info("DB pool initialized (min=%s max=%s)", DB_POOL_MIN, DB_POOL_MAX)
+    logger.info("DB pool initialized (min=%s max=%s)", settings.DB_POOL_MIN, settings.DB_POOL_MAX)
 
 
 def get_db_conn():
@@ -168,7 +162,7 @@ def return_db_conn(conn) -> None:
 # -------------------------------------------------------------------
 
 def ensure_tables_and_migrations() -> None:
-    if not DATABASE_URL:
+    if not settings.DATABASE_URL:
         return
 
     ddl = """
@@ -247,7 +241,7 @@ def insert_main_scan(
     ip_address: Optional[str],
     user_agent: Optional[str],
 ) -> None:
-    if not DATABASE_URL:
+    if not settings.DATABASE_URL:
         return
 
     conn = None
@@ -312,7 +306,7 @@ def insert_competitor_scan(
     scores: Dict[str, int],
     raw_bundle: Dict[str, Any],
 ) -> None:
-    if not DATABASE_URL:
+    if not settings.DATABASE_URL:
         return
 
     conn = None
@@ -350,16 +344,71 @@ def insert_competitor_scan(
         return_db_conn(conn)
 
 # -------------------------------------------------------------------
-# Startup
+# Lifespan Context Manager
 # -------------------------------------------------------------------
 
-@app.on_event("startup")
-def startup() -> None:
-    logger.info("VizAI API starting… DATABASE_URL present=%s", bool(DATABASE_URL))
-    if DATABASE_URL:
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manage application lifecycle (startup and shutdown)"""
+    # Startup
+    logger.info("VizAI API starting… DATABASE_URL present=%s", bool(settings.DATABASE_URL))
+    if settings.DATABASE_URL:
         init_db_pool()
         ensure_tables_and_migrations()
     logger.info("VizAI API started")
+
+    yield
+
+    # Shutdown
+    global _db_pool
+    if _db_pool:
+        logger.info("Closing database connection pool...")
+        _db_pool.closeall()
+        logger.info("Database pool closed")
+
+# -------------------------------------------------------------------
+# Rate Limiting
+# -------------------------------------------------------------------
+
+limiter = Limiter(key_func=get_remote_address)
+
+# -------------------------------------------------------------------
+# FastAPI App
+# -------------------------------------------------------------------
+
+app = FastAPI(
+    title="VizAI Scan API",
+    version="1.4.2",
+    description="VizAI: evidence-based LLM visibility scanning with competitor baselines.",
+    lifespan=lifespan,
+)
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# -------------------------------------------------------------------
+# Request ID Middleware
+# -------------------------------------------------------------------
+
+@app.middleware("http")
+async def add_request_id_middleware(request: Request, call_next):
+    """Add unique request ID to all requests for tracing"""
+    request_id = str(uuid.uuid4())[:8]  # Short ID for readability
+    request.state.request_id = request_id
+
+    # Add to response headers for client-side debugging
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[settings.FRONTEND_ORIGIN],
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 # -------------------------------------------------------------------
 # Routes
@@ -374,14 +423,14 @@ def root():
 def health():
     services = {
         "api": "operational",
-        "database": "not_configured" if not DATABASE_URL else "unknown",
-        "email": "operational" if EMAIL_NOTIFICATIONS_ENABLED else "not_configured",
-        "perplexity": "operational" if PERPLEXITY_API_KEY else "not_configured",
-        "openai_fallback": "operational" if OPENAI_API_KEY else "not_configured",
+        "database": "not_configured" if not settings.DATABASE_URL else "unknown",
+        "email": "operational" if settings.email_notifications_enabled else "not_configured",
+        "perplexity": "operational" if settings.PERPLEXITY_API_KEY else "not_configured",
+        "openai_fallback": "operational" if settings.OPENAI_API_KEY else "not_configured",
     }
 
     db_identity = None
-    if DATABASE_URL:
+    if settings.DATABASE_URL:
         conn = None
         try:
             conn = get_db_conn()
@@ -402,7 +451,7 @@ def health():
         "status": "healthy",
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "services": services,
-        "db_url_present": bool(DATABASE_URL),
+        "db_url_present": bool(settings.DATABASE_URL),
         "db_identity": {"database": db_identity[0], "user": db_identity[1]} if db_identity else None,
     }
 
@@ -412,7 +461,16 @@ def health():
 # -----------------------
 
 @app.post("/run_scan", response_model=ScanResponse)
+@limiter.limit("10/minute")
 def run_scan(payload: ScanRequest, request: Request):
+    # Get request ID from middleware
+    request_id = getattr(request.state, "request_id", "-")
+
+    # Generate scan ID
+    scan_id = uuid.uuid4()
+    scan_id_str = str(scan_id)[:8]  # Short ID for logging
+    created_at = datetime.now(timezone.utc)
+
     # request metadata (Render/proxies safe)
     client_ip = None
     try:
@@ -436,17 +494,15 @@ def run_scan(payload: ScanRequest, request: Request):
     logger.info(
         "Scan start: biz=%s db_url_present=%s ip=%s ua_present=%s competitors=%s questions=%s",
         payload.businessName,
-        bool(DATABASE_URL),
+        bool(settings.DATABASE_URL),
         client_ip,
         bool(user_agent),
         len(payload.competitors),
         len(payload.questions),
+        extra={"request_id": request_id, "scan_id": scan_id_str}
     )
 
     from scan_engine_real import run_real_scan_perplexity
-
-    scan_id = uuid.uuid4()
-    created_at = datetime.now(timezone.utc)
 
     raw_llm: Optional[Dict[str, Any]] = None
 
@@ -479,11 +535,15 @@ def run_scan(payload: ScanRequest, request: Request):
             email_sent=False,
         )
     except Exception as e:
-        logger.exception("Real scan failed: %s", e)
+        logger.exception(
+            "Real scan failed: %s",
+            e,
+            extra={"request_id": request_id, "scan_id": scan_id_str}
+        )
         raise HTTPException(status_code=500, detail=str(e))
 
     # --- Store main scan (fail loud if DB configured)
-    if DATABASE_URL:
+    if settings.DATABASE_URL:
         try:
             insert_main_scan(
                 scan_id=scan_id,
@@ -495,31 +555,90 @@ def run_scan(payload: ScanRequest, request: Request):
                 user_agent=user_agent,
             )
         except Exception as e:
-            logger.exception("DB insert failed: %s", e)
+            logger.exception(
+                "DB insert failed: %s",
+                e,
+                extra={"request_id": request_id, "scan_id": scan_id_str}
+            )
             raise HTTPException(status_code=500, detail=f"DB insert failed: {e}")
 
         # --- Competitor baseline scans (best-effort; never break main scan)
-        for c in (payload.competitors or []):
-            try:
-                comp_obj, comp_bundle = run_real_scan_perplexity(
-                    business_name=c.name,
-                    website=str(c.website),
-                )
-                insert_competitor_scan(
-                    parent_scan_id=scan_id,
-                    created_at=created_at,
-                    competitor_name=c.name,
-                    competitor_website=str(c.website),
-                    scores={
-                        "discovery": int(comp_obj.discovery_score),
-                        "accuracy": int(comp_obj.accuracy_score),
-                        "authority": int(comp_obj.authority_score),
-                        "overall": int(comp_obj.overall_score),
-                    },
-                    raw_bundle=comp_bundle,
-                )
-            except Exception as e:
-                logger.exception("Competitor scan/insert failed (non-fatal) for %s: %s", c.name, e)
+        # Run competitor scans in parallel for better performance
+        competitors_list = payload.competitors or []
+
+        if competitors_list:
+            def scan_single_competitor(competitor_data):
+                """Scan a single competitor and return results"""
+                try:
+                    comp_obj, comp_bundle = run_real_scan_perplexity(
+                        business_name=competitor_data.name,
+                        website=str(competitor_data.website),
+                    )
+                    return {
+                        "success": True,
+                        "name": competitor_data.name,
+                        "website": str(competitor_data.website),
+                        "comp_obj": comp_obj,
+                        "comp_bundle": comp_bundle,
+                    }
+                except Exception as e:
+                    logger.warning(
+                        "Competitor scan failed (non-fatal) for %s: %s",
+                        competitor_data.name,
+                        str(e)
+                    )
+                    return {
+                        "success": False,
+                        "name": competitor_data.name,
+                        "error": str(e),
+                    }
+
+            # Use ThreadPoolExecutor for parallel scanning
+            # max_workers configurable via settings to avoid overwhelming the API
+            logger.info(
+                "Starting parallel scan of %d competitors with %d workers",
+                len(competitors_list),
+                settings.MAX_COMPETITOR_SCAN_WORKERS,
+                extra={"request_id": request_id, "scan_id": scan_id_str}
+            )
+            with ThreadPoolExecutor(max_workers=settings.MAX_COMPETITOR_SCAN_WORKERS) as executor:
+                # Submit all competitor scans
+                future_to_competitor = {
+                    executor.submit(scan_single_competitor, comp): comp
+                    for comp in competitors_list
+                }
+
+                # Process results as they complete
+                for future in as_completed(future_to_competitor):
+                    result_data = future.result()
+
+                    if result_data["success"]:
+                        try:
+                            insert_competitor_scan(
+                                parent_scan_id=scan_id,
+                                created_at=created_at,
+                                competitor_name=result_data["name"],
+                                competitor_website=result_data["website"],
+                                scores={
+                                    "discovery": int(result_data["comp_obj"].discovery_score),
+                                    "accuracy": int(result_data["comp_obj"].accuracy_score),
+                                    "authority": int(result_data["comp_obj"].authority_score),
+                                    "overall": int(result_data["comp_obj"].overall_score),
+                                },
+                                raw_bundle=result_data["comp_bundle"],
+                            )
+                            logger.info("Successfully inserted competitor scan: %s", result_data["name"])
+                        except Exception as e:
+                            logger.exception(
+                                "Failed to insert competitor scan for %s: %s",
+                                result_data["name"],
+                                e
+                            )
+
+            logger.info(
+                "Completed parallel competitor scanning",
+                extra={"request_id": request_id, "scan_id": scan_id_str}
+            )
 
     return result
 
@@ -530,7 +649,7 @@ def run_scan(payload: ScanRequest, request: Request):
 
 @app.get("/scan/{scan_id}/competitors")
 def get_scan_competitors(scan_id: str):
-    if not DATABASE_URL:
+    if not settings.DATABASE_URL:
         raise HTTPException(status_code=501, detail="Database not configured")
 
     try:
@@ -563,26 +682,30 @@ def get_scan_competitors(scan_id: str):
             )
             rows = cur.fetchall()
 
-        return {
+        # Build competitor list
+        competitors = []
+        for r in rows:
+            competitors.append({
+                "name": r[0],
+                "website": r[1],
+                "scores": {
+                    "discovery": r[2],
+                    "accuracy": r[3],
+                    "authority": r[4],
+                    "overall": r[5],
+                },
+                "created_at": r[6].isoformat() if r[6] else None,
+            })
+
+        result = {
             "scan_id": scan_id,
             "count": len(rows),
-            "competitors": [
-                {
-                    "name": r[0],
-                    "website": r[1],
-                    "scores": {
-                        "discovery": r[2],
-                        "accuracy": r[3],
-                        "authority": r[4],
-                        "overall": r[5],
-                    },
-                    "created_at": r[6].isoformat() if r[6] else None,
-                }
-                for r in rows
-            ],
+            "competitors": competitors,
         }
     finally:
         return_db_conn(conn)
+
+    return result
 
 
 # -------------------------------------------------------------------
@@ -592,15 +715,3 @@ def get_scan_competitors(scan_id: str):
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
-l})
-
-
-
-
-
-
-
-
-
-
-
