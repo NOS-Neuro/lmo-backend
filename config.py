@@ -34,10 +34,10 @@ class Settings(BaseSettings):
         description="Perplexity model to use"
     )
     PERPLEXITY_TIMEOUT: int = Field(
-        default=45,
+        default=90,
         ge=10,
         le=300,
-        description="Perplexity API timeout in seconds (10-300)"
+        description="Perplexity API timeout in seconds (10-300, default: 90)"
     )
 
     # Database settings
