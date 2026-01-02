@@ -92,6 +92,12 @@ class Settings(BaseSettings):
         description="Maximum parallel workers for competitor scans (1-10)"
     )
 
+    # Cloudflare Turnstile settings
+    TURNSTILE_SECRET_KEY: Optional[str] = Field(
+        default=None,
+        description="Cloudflare Turnstile secret key for bot protection verification"
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
