@@ -1,5 +1,6 @@
 import uuid
 import logging
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -84,12 +85,15 @@ class QuestionIn(BaseModel):
 
 class ScanRequest(BaseModel):
     businessName: str = Field(..., min_length=2, max_length=200)
+    industry: Optional[str] = Field(default=None, max_length=100)
     website: HttpUrl
     contactEmail: EmailStr
     requestContact: bool = False
+    captchaToken: str = Field(..., min_length=10)
     models: List[str] = Field(default=[], max_length=5)
     competitors: List[CompetitorIn] = Field(default=[], max_length=10)
     questions: List[QuestionIn] = Field(default=[], max_length=20)
+
 
     @field_validator("businessName")
     @classmethod
@@ -98,6 +102,12 @@ class ScanRequest(BaseModel):
         if len(v) < 2:
             raise ValueError("Business name too short")
         return v
+
+
+class QAPair(BaseModel):
+    question: str
+    answer: str
+    prompt_name: Optional[str] = None
 
 
 class ScanResponse(BaseModel):
@@ -113,6 +123,7 @@ class ScanResponse(BaseModel):
     package_explanation: str
     strategy_summary: str
     findings: List[str]
+    qa_pairs: Optional[List[QAPair]] = None
 
     email_sent: Optional[bool] = None
 
@@ -170,6 +181,7 @@ def ensure_tables_and_migrations() -> None:
       scan_id UUID PRIMARY KEY,
       created_at TIMESTAMPTZ NOT NULL,
       business_name TEXT NOT NULL,
+      industry TEXT,
       website TEXT NOT NULL,
       contact_email TEXT NOT NULL,
       request_contact BOOLEAN NOT NULL,
@@ -190,6 +202,15 @@ def ensure_tables_and_migrations() -> None:
       ip_address TEXT,
       user_agent TEXT
     );
+
+    -- Migration: Add industry column if it doesn't exist
+    DO $$
+    BEGIN
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                      WHERE table_name='vizai_scans' AND column_name='industry') THEN
+            ALTER TABLE vizai_scans ADD COLUMN industry TEXT;
+        END IF;
+    END $$;
 
     CREATE INDEX IF NOT EXISTS idx_vizai_scans_created_at ON vizai_scans(created_at DESC);
 
@@ -254,13 +275,13 @@ def insert_main_scan(
             cur.execute(
                 """
                 INSERT INTO vizai_scans (
-                    scan_id, created_at, business_name, website, contact_email, request_contact,
+                    scan_id, created_at, business_name, industry, website, contact_email, request_contact,
                     discovery_score, accuracy_score, authority_score, overall_score,
                     package_recommendation, package_explanation, strategy_summary,
                     findings, raw_llm, email_sent, ip_address, user_agent
                 )
                 VALUES (
-                    %s,%s,%s,%s,%s,%s,
+                    %s,%s,%s,%s,%s,%s,%s,
                     %s,%s,%s,%s,
                     %s,%s,%s,
                     %s,%s,%s,%s,%s
@@ -270,6 +291,7 @@ def insert_main_scan(
                     str(scan_id),
                     created_at,
                     payload.businessName,
+                    payload.industry,
                     str(payload.website),
                     str(payload.contactEmail),
                     bool(payload.requestContact),
@@ -414,6 +436,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def verify_turnstile(token: str, remote_ip: Optional[str] = None) -> bool:
+    # Fail closed if secret missing (recommended for production)
+    if not settings.TURNSTILE_SECRET_KEY:
+        logger.error("TURNSTILE_SECRET_KEY not configured")
+        return False
+
+    if not token:
+        return False
+
+    try:
+        resp = requests.post(
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+            data={
+                "secret": settings.TURNSTILE_SECRET_KEY,
+                "response": token,
+                **({"remoteip": remote_ip} if remote_ip else {}),
+            },
+            timeout=settings.TURNSTILE_TIMEOUT,
+        )
+        data = resp.json()
+        return bool(data.get("success"))
+    except Exception as e:
+        logger.exception("Turnstile verification error: %s", e)
+        return False
+
+
 # -------------------------------------------------------------------
 # Routes
 # -------------------------------------------------------------------
@@ -495,6 +543,11 @@ def run_scan(payload: ScanRequest, request: Request):
 
     user_agent = request.headers.get("user-agent")
 
+    # --- CAPTCHA enforcement (anti-abuse)
+    if not verify_turnstile(payload.captchaToken, client_ip):
+     raise HTTPException(status_code=400, detail="Captcha verification failed")
+
+
     logger.info(
         "Scan start: biz=%s db_url_present=%s ip=%s ua_present=%s competitors=%s questions=%s",
         payload.businessName,
@@ -519,11 +572,21 @@ def run_scan(payload: ScanRequest, request: Request):
         result_obj, raw_bundle = run_real_scan_perplexity(
             business_name=payload.businessName,
             website=str(payload.website),
+            industry=payload.industry,
             questions=custom_questions,
             competitors=[{"name": c.name, "website": str(c.website)} for c in (payload.competitors or [])],
         )
 
         raw_llm = raw_bundle
+
+        # Extract Q&A pairs from raw_bundle
+        qa_pairs = []
+        for run in raw_bundle.get("runs", []):
+            qa_pairs.append(QAPair(
+                question=run.get("question", ""),
+                answer=run.get("answer_text", ""),
+                prompt_name=run.get("prompt_name")
+            ))
 
         result = ScanResponse(
             scan_id=str(scan_id),
@@ -536,6 +599,7 @@ def run_scan(payload: ScanRequest, request: Request):
             package_explanation=str(result_obj.package_explanation),
             strategy_summary=str(result_obj.strategy_summary),
             findings=list(result_obj.findings or []),
+            qa_pairs=qa_pairs,
             email_sent=False,
         )
     except Exception as e:

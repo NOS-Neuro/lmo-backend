@@ -17,6 +17,20 @@ class Settings(BaseSettings):
         default=None,
         description="Perplexity API key for web search (primary provider)"
     )
+    
+       # --------------------------------------------------
+    # Security / Anti-Abuse (CAPTCHA)
+    # --------------------------------------------------
+    TURNSTILE_SECRET_KEY: Optional[str] = Field(
+        default=None,
+        description="Cloudflare Turnstile secret key for server-side verification"
+    )
+    TURNSTILE_TIMEOUT: int = Field(
+        default=10,
+        ge=1,
+        le=30,
+        description="Turnstile verification timeout (seconds)"
+    )
 
     # Optional AI settings
     OPENAI_API_KEY: Optional[str] = Field(
@@ -91,13 +105,7 @@ class Settings(BaseSettings):
         le=10,
         description="Maximum parallel workers for competitor scans (1-10)"
     )
-
-    # Cloudflare Turnstile settings
-    TURNSTILE_SECRET_KEY: Optional[str] = Field(
-        default=None,
-        description="Cloudflare Turnstile secret key for bot protection verification"
-    )
-
+    
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

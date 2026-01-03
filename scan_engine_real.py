@@ -285,6 +285,7 @@ def run_real_scan_perplexity(
     *,
     business_name: str,
     website: str,
+    industry: Optional[str] = None,
     competitors: Optional[List[Dict[str, Any]]] = None,
     questions: Optional[List[Tuple[str, str]]] = None,
 ) -> Tuple[RealScanResult, Dict[str, Any]]:
@@ -325,8 +326,9 @@ def run_real_scan_perplexity(
     )
 
     for prompt_name, q in qs:
+        industry_context = f"\nIndustry: {industry}" if industry else ""
         user = (
-            f"Company name: {business_name}\n"
+            f"Company name: {business_name}{industry_context}\n"
             f"Official website (given): {website}\n\n"
             f"Task: {q}\n\n"
             f"Rules:\n"
