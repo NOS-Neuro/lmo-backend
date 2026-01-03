@@ -322,14 +322,14 @@ def run_real_scan_perplexity(
     system = (
         "You are an audit assistant using web search. "
         "Do not guess. If information is missing, say 'unclear'. "
-        "Prefer citing the official website when available."
+        "Search for official and authoritative sources."
     )
 
     for prompt_name, q in qs:
+        # Don't mention the website - let Perplexity discover it naturally
         industry_context = f"\nIndustry: {industry}" if industry else ""
         user = (
-            f"Company name: {business_name}{industry_context}\n"
-            f"Official website (given): {website}\n\n"
+            f"Company name: {business_name}{industry_context}\n\n"
             f"Task: {q}\n\n"
             f"Rules:\n"
             f"- Only state facts supported by citations.\n"
