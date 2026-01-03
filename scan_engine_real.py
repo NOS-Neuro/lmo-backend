@@ -15,12 +15,14 @@ Honesty:
 from __future__ import annotations
 
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import requests
+from requests.exceptions import Timeout, RequestException
 
 from core.prompts import DEFAULT_QUESTIONS
 from config import settings
@@ -185,6 +187,7 @@ class PerplexityClient:
         system: str,
         user: str,
         max_tokens: int = 650,
+        max_retries: int = 3,
     ) -> Tuple[str, List[PerplexityHit], Dict[str, Any]]:
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -203,9 +206,45 @@ class PerplexityClient:
             "stream": False,
         }
 
-        r = requests.post(self.BASE_URL, headers=headers, json=payload, timeout=self.timeout)
-        if r.status_code < 200 or r.status_code >= 300:
-            raise RuntimeError(f"Perplexity API error {r.status_code}: {r.text}")
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                r = requests.post(
+                    self.BASE_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout
+                )
+                if r.status_code < 200 or r.status_code >= 300:
+                    # Don't retry on 4xx errors (client errors)
+                    if 400 <= r.status_code < 500:
+                        raise RuntimeError(f"Perplexity API error {r.status_code}: {r.text}")
+                    # Retry on 5xx errors (server errors)
+                    last_error = RuntimeError(f"Perplexity API error {r.status_code}: {r.text}")
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                        time.sleep(wait_time)
+                        continue
+                    raise last_error
+
+                # Success - break out of retry loop
+                break
+
+            except Timeout as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    time.sleep(wait_time)
+                    continue
+                raise RuntimeError(f"Perplexity API timeout after {max_retries} attempts") from e
+
+            except RequestException as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    time.sleep(wait_time)
+                    continue
+                raise RuntimeError(f"Perplexity API request failed after {max_retries} attempts") from e
 
         data = r.json()
         answer = data["choices"][0]["message"]["content"]
@@ -246,6 +285,7 @@ def run_real_scan_perplexity(
     *,
     business_name: str,
     website: str,
+    industry: Optional[str] = None,
     competitors: Optional[List[Dict[str, Any]]] = None,
     questions: Optional[List[Tuple[str, str]]] = None,
 ) -> Tuple[RealScanResult, Dict[str, Any]]:
@@ -282,13 +322,14 @@ def run_real_scan_perplexity(
     system = (
         "You are an audit assistant using web search. "
         "Do not guess. If information is missing, say 'unclear'. "
-        "Prefer citing the official website when available."
+        "Search for official and authoritative sources."
     )
 
     for prompt_name, q in qs:
+        # Don't mention the website - let Perplexity discover it naturally
+        industry_context = f"\nIndustry: {industry}" if industry else ""
         user = (
-            f"Company name: {business_name}\n"
-            f"Official website (given): {website}\n\n"
+            f"Company name: {business_name}{industry_context}\n\n"
             f"Task: {q}\n\n"
             f"Rules:\n"
             f"- Only state facts supported by citations.\n"
