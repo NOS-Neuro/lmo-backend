@@ -1,0 +1,109 @@
+[1mdiff --git a/config.py b/config.py[m
+[1mindex 2684b73..3a07d79 100644[m
+[1m--- a/config.py[m
+[1m+++ b/config.py[m
+[36m@@ -17,6 +17,20 @@[m [mclass Settings(BaseSettings):[m
+         default=None,[m
+         description="Perplexity API key for web search (primary provider)"[m
+     )[m
+[32m+[m[41m    [m
+[32m+[m[32m       # --------------------------------------------------[m
+[32m+[m[32m    # Security / Anti-Abuse (CAPTCHA)[m
+[32m+[m[32m    # --------------------------------------------------[m
+[32m+[m[32m    TURNSTILE_SECRET_KEY: Optional[str] = Field([m
+[32m+[m[32m        default=None,[m
+[32m+[m[32m        description="Cloudflare Turnstile secret key for server-side verification"[m
+[32m+[m[32m    )[m
+[32m+[m[32m    TURNSTILE_TIMEOUT: int = Field([m
+[32m+[m[32m        default=10,[m
+[32m+[m[32m        ge=1,[m
+[32m+[m[32m        le=30,[m
+[32m+[m[32m        description="Turnstile verification timeout (seconds)"[m
+[32m+[m[32m    )[m
+ [m
+     # Optional AI settings[m
+     OPENAI_API_KEY: Optional[str] = Field([m
+[36m@@ -91,13 +105,7 @@[m [mclass Settings(BaseSettings):[m
+         le=10,[m
+         description="Maximum parallel workers for competitor scans (1-10)"[m
+     )[m
+[31m-[m
+[31m-    # Cloudflare Turnstile settings[m
+[31m-    TURNSTILE_SECRET_KEY: Optional[str] = Field([m
+[31m-        default=None,[m
+[31m-        description="Cloudflare Turnstile secret key for bot protection verification"[m
+[31m-    )[m
+[31m-[m
+[32m+[m[41m    [m
+     model_config = SettingsConfigDict([m
+         env_file=".env",[m
+         env_file_encoding="utf-8",[m
+[1mdiff --git a/main.py b/main.py[m
+[1mindex 5a9230b..dcd1003 100644[m
+[1m--- a/main.py[m
+[1m+++ b/main.py[m
+[36m@@ -1,5 +1,6 @@[m
+ import uuid[m
+ import logging[m
+[32m+[m[32mimport requests[m
+ from concurrent.futures import ThreadPoolExecutor, as_completed[m
+ from contextlib import asynccontextmanager[m
+ from datetime import datetime, timezone[m
+[36m@@ -87,10 +88,12 @@[m [mclass ScanRequest(BaseModel):[m
+     website: HttpUrl[m
+     contactEmail: EmailStr[m
+     requestContact: bool = False[m
+[32m+[m[32m    captchaToken: str = Field(..., min_length=10) # ✅ ADD THIS[m
+     models: List[str] = Field(default=[], max_length=5)[m
+     competitors: List[CompetitorIn] = Field(default=[], max_length=10)[m
+     questions: List[QuestionIn] = Field(default=[], max_length=20)[m
+ [m
+[32m+[m
+     @field_validator("businessName")[m
+     @classmethod[m
+     def validate_business_name(cls, v: str) -> str:[m
+[36m@@ -414,6 +417,32 @@[m [mapp.add_middleware([m
+     allow_headers=["*"],[m
+ )[m
+ [m
+[32m+[m[32mdef verify_turnstile(token: str, remote_ip: Optional[str] = None) -> bool:[m
+[32m+[m[32m    # Fail closed if secret missing (recommended for production)[m
+[32m+[m[32m    if not settings.TURNSTILE_SECRET_KEY:[m
+[32m+[m[32m        logger.error("TURNSTILE_SECRET_KEY not configured")[m
+[32m+[m[32m        return False[m
+[32m+[m
+[32m+[m[32m    if not token:[m
+[32m+[m[32m        return False[m
+[32m+[m
+[32m+[m[32m    try:[m
+[32m+[m[32m        resp = requests.post([m
+[32m+[m[32m            "https://challenges.cloudflare.com/turnstile/v0/siteverify",[m
+[32m+[m[32m            data={[m
+[32m+[m[32m                "secret": settings.TURNSTILE_SECRET_KEY,[m
+[32m+[m[32m                "response": token,[m
+[32m+[m[32m                **({"remoteip": remote_ip} if remote_ip else {}),[m
+[32m+[m[32m            },[m
+[32m+[m[32m            timeout=settings.TURNSTILE_TIMEOUT,[m
+[32m+[m[32m        )[m
+[32m+[m[32m        data = resp.json()[m
+[32m+[m[32m        return bool(data.get("success"))[m
+[32m+[m[32m    except Exception as e:[m
+[32m+[m[32m        logger.exception("Turnstile verification error: %s", e)[m
+[32m+[m[32m        return False[m
+[32m+[m
+[32m+[m
+ # -------------------------------------------------------------------[m
+ # Routes[m
+ # -------------------------------------------------------------------[m
+[36m@@ -495,6 +524,11 @@[m [mdef run_scan(payload: ScanRequest, request: Request):[m
+ [m
+     user_agent = request.headers.get("user-agent")[m
+ [m
+[32m+[m[32m    # --- CAPTCHA enforcement (anti-abuse)[m
+[32m+[m[32m    if not verify_turnstile(payload.captchaToken, client_ip):[m
+[32m+[m[32m     raise HTTPException(status_code=400, detail="Captcha verification failed")[m
+[32m+[m
+[32m+[m
+     logger.info([m
+         "Scan start: biz=%s db_url_present=%s ip=%s ua_present=%s competitors=%s questions=%s",[m
+         payload.businessName,[m
