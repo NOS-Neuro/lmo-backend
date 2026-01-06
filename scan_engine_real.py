@@ -68,6 +68,11 @@ class RealScanResult:
     provider_results: List[ProviderResult]
     metrics: Dict[str, Any]
 
+    # Entity validation fields
+    entity_status: Optional[str] = None
+    entity_confidence: Optional[int] = None
+    warnings: Optional[List[str]] = None
+
 
 # -----------------------------
 # Helpers
@@ -402,8 +407,6 @@ class PerplexityClient:
 
 
 # -----------------------------
-<<<<<<< Updated upstream
-=======
 # OpenAI Validator (evidence consistency checker ONLY)
 # -----------------------------
 
@@ -536,7 +539,6 @@ Evaluate the answer's support from these citations only. Return JSON only."""
 
 
 # -----------------------------
->>>>>>> Stashed changes
 # Scan prompts
 # -----------------------------
 
@@ -578,19 +580,34 @@ def run_real_scan_perplexity(
     )
 
     biz_domain = _domain(website)
-    qs = questions or DEFAULT_QUESTIONS
+
+    # Build question list: identity questions FIRST, then discovery questions
+    if questions:
+        qs = questions
+    else:
+        identity_qs = get_identity_questions(website)
+        qs = identity_qs + list(DEFAULT_QUESTIONS)
 
     provider_results: List[ProviderResult] = []
     raw_bundle: Dict[str, Any] = {
-        "engine": "real_perplexity_mvp_v3",
+        "engine": "perplexity_validated_v5",
         "provider": "perplexity",
         "model": settings.PERPLEXITY_MODEL,
         "runs": [],
         "notes": [
             "Discovery/Authority are evidence-based from returned citations.",
             "Accuracy is a proxy until a Truth File compare is implemented.",
+            "Entity identity computed from Perplexity evidence only.",
+            "Gating rules applied based on entity confidence and unclear rate.",
         ],
         "competitors": competitors or [],
+        "identity": {},  # Will be populated after queries complete
+        "validation": {  # Optional OpenAI validator results
+            "mode": "openai_validator" if settings.OPENAI_API_KEY else "disabled",
+            "model": "gpt-4o-mini" if settings.OPENAI_API_KEY else None,
+            "runs": [],
+            "notes": [],
+        },
     }
 
     system = (
@@ -646,6 +663,55 @@ def run_real_scan_perplexity(
     cite_domains = [_domain(h.url) for h in all_hits if h.url]
     uniq_domains = _unique([d for d in cite_domains if d])
 
+    # -----------------------------
+    # Entity Identity Gate (from Perplexity evidence ONLY)
+    # -----------------------------
+    identity_result = compute_entity_identity(
+        submitted_domain=biz_domain,
+        business_name=business_name,
+        perplexity_results=provider_results,
+        all_text=all_text,
+    )
+    raw_bundle["identity"] = identity_result
+
+    entity_status = identity_result["entity_status"]
+    entity_confidence = identity_result["entity_confidence"]
+    unclear_rate = identity_result["unclear_rate"]
+    official_domain_detected = identity_result["official_domain_detected"]
+    submitted_domain_cited = identity_result["submitted_domain_cited"]
+
+    # -----------------------------
+    # Optional Validator Layer (OpenAI evaluates Perplexity evidence)
+    # -----------------------------
+    if settings.OPENAI_API_KEY:
+        try:
+            validator = OpenAIValidator(
+                api_key=settings.OPENAI_API_KEY,
+                model="gpt-4o-mini",
+                timeout=15,
+            )
+
+            for r in provider_results:
+                citation_urls = [hit.url for hit in r.citations if hit.url]
+                validation = validator.validate_answer(
+                    question=r.question,
+                    answer=r.answer_text,
+                    citations=citation_urls,
+                    official_domain=official_domain_detected or None,
+                )
+
+                if validation:
+                    raw_bundle["validation"]["runs"].append({
+                        "prompt_name": r.prompt_name,
+                        "validation": validation,
+                    })
+
+        except Exception as e:
+            raw_bundle["validation"]["notes"].append(f"Validator error (non-fatal): {str(e)}")
+            logger.warning(f"OpenAI validator error (non-fatal): {e}")
+    else:
+        raw_bundle["validation"]["notes"].append("Validation skipped: no OPENAI_API_KEY")
+
     mentions_name = _contains_name(all_text, business_name)
     mentions_domain = bool(biz_domain and biz_domain in _norm(all_text))
     cites_official = bool(biz_domain and any(d == biz_domain for d in cite_domains))
@@ -700,13 +766,80 @@ def run_real_scan_perplexity(
     authority += _clamp_int(bonus, default=0, lo=0, hi=20)
     authority = _clamp_int(authority, default=50)
 
-    # Internal caps (do NOT mention in findings)
-    discovery = min(discovery, 95)
-    accuracy = min(accuracy, 95)
-    authority = min(authority, 95)
+    # -----------------------------
+    # Hard Gating Rules (score compression and entity-based caps)
+    # -----------------------------
+    warnings: List[str] = []
 
+    # Count submitted domain citations
+    submitted_domain_cite_count = sum(1 for d in cite_domains if d == biz_domain)
+
+    # Entity status gates
+    if entity_status in {"UNCLEAR", "MISMATCH"}:
+        warnings.append(f"Entity status is {entity_status} - overall score capped at 60")
+
+    if official_domain_detected and official_domain_detected != biz_domain:
+        warnings.append(f"Domain mismatch detected: submitted '{biz_domain}' vs detected '{official_domain_detected}' - overall score capped at 70")
+
+    if not submitted_domain_cited:
+        warnings.append("Submitted domain was never cited - discovery/accuracy/authority penalties applied")
+
+    # Unclear rate penalties
+    if unclear_rate > 0.50:
+        warnings.append(f"High unclear rate ({unclear_rate:.1%}) - overall score capped at 65")
+    elif unclear_rate > 0.30:
+        warnings.append(f"Moderate unclear rate ({unclear_rate:.1%}) - overall score capped at 75")
+
+    # Apply proportional accuracy reduction based on unclear rate
+    accuracy_unclear_penalty = int(unclear_rate * 30)  # Max -30 points at 100% unclear
+    accuracy -= accuracy_unclear_penalty
+
+    # Apply entity-based score penalties
+    if not submitted_domain_cited:
+        discovery = min(discovery, 70)
+        authority = min(authority, 60)
+        accuracy = min(accuracy, 70)
+
+    # Clamp all scores 0-100 after penalties
+    discovery = _clamp_int(discovery, default=0, lo=0, hi=100)
+    accuracy = _clamp_int(accuracy, default=0, lo=0, hi=100)
+    authority = _clamp_int(authority, default=0, lo=0, hi=100)
+
+    # Compute preliminary overall score
     overall, package, explanation, strategy = derive_recommendation(discovery, accuracy, authority)
-    overall = min(overall, 95)
+    overall = _clamp_int(overall, default=50, lo=0, hi=100)
+
+    # Apply entity status caps to overall score
+    if entity_status in {"UNCLEAR", "MISMATCH"}:
+        overall = min(overall, 60)
+
+    if official_domain_detected and official_domain_detected != biz_domain:
+        overall = min(overall, 70)
+
+    # Apply unclear rate caps to overall score
+    if unclear_rate > 0.50:
+        overall = min(overall, 65)
+    elif unclear_rate > 0.30:
+        overall = min(overall, 75)
+
+    # 90+ Score Decompression (make 90+ rare and earned)
+    if overall >= 90:
+        # Must meet ALL requirements for 90+
+        if entity_status != "CONFIRMED":
+            overall = min(overall, 85)
+            warnings.append("90+ requires CONFIRMED entity status - capped at 85")
+        if submitted_domain_cite_count < 2:
+            overall = min(overall, 85)
+            warnings.append("90+ requires domain cited 2+ times - capped at 85")
+        if len(uniq_domains) < 6:
+            overall = min(overall, 85)
+            warnings.append("90+ requires 6+ unique citation domains - capped at 85")
+        if unclear_rate >= 0.20:
+            overall = min(overall, 85)
+            warnings.append("90+ requires unclear rate < 20% - capped at 85")
+
+    # Final clamp
+    overall = _clamp_int(overall, default=50, lo=0, hi=100)
 
     # -----------------------------
     # Metrics
@@ -729,6 +862,13 @@ def run_real_scan_perplexity(
             "has_contact": bool(has_contact),
             "score_0_to_3": comprehensiveness_hits,
         },
+        "entity_identity": {
+            "status": entity_status,
+            "confidence": entity_confidence,
+            "unclear_rate": unclear_rate,
+            "submitted_domain_cite_count": submitted_domain_cite_count,
+        },
+        "gating_warnings": warnings,
     }
 
     # -----------------------------
@@ -821,6 +961,9 @@ def run_real_scan_perplexity(
         findings=findings,
         provider_results=provider_results,
         metrics=metrics,
+        entity_status=entity_status,
+        entity_confidence=entity_confidence,
+        warnings=warnings if warnings else None,
     )
 
     return result, raw_bundle

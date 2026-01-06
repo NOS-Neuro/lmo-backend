@@ -132,6 +132,11 @@ class ScanResponse(BaseModel):
 
     email_sent: Optional[bool] = None
 
+    # Entity validation fields (optional, non-breaking)
+    entity_status: Optional[str] = None
+    entity_confidence: Optional[int] = None
+    warnings: Optional[List[str]] = None
+
     disclaimer: str = (
         "This scan is evidence-based when run in Real Scan mode. "
         "Fallback mode is an honest AI-assisted estimate."
@@ -872,6 +877,9 @@ def run_scan(payload: ScanRequest, request: Request):
             findings=list(result_obj.findings or []),
             qa_pairs=qa_pairs,
             email_sent=False,
+            entity_status=result_obj.entity_status,
+            entity_confidence=result_obj.entity_confidence,
+            warnings=result_obj.warnings,
         )
     except Exception as e:
         logger.exception(
