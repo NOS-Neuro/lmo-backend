@@ -439,10 +439,11 @@ app.add_middleware(
 def verify_turnstile(token: str, remote_ip: Optional[str] = None) -> bool:
     # Fail closed if secret missing (recommended for production)
     if not settings.TURNSTILE_SECRET_KEY:
-        logger.error("TURNSTILE_SECRET_KEY not configured")
+        logger.error("TURNSTILE_SECRET_KEY not configured - captcha validation will fail")
         return False
 
     if not token:
+        logger.warning("Turnstile verification failed: empty token provided")
         return False
 
     try:
@@ -456,9 +457,28 @@ def verify_turnstile(token: str, remote_ip: Optional[str] = None) -> bool:
             timeout=settings.TURNSTILE_TIMEOUT,
         )
         data = resp.json()
-        return bool(data.get("success"))
+        success = bool(data.get("success"))
+
+        if not success:
+            error_codes = data.get("error-codes", [])
+            logger.warning(
+                "Turnstile verification failed: success=%s, error_codes=%s, remote_ip=%s",
+                success,
+                error_codes,
+                remote_ip
+            )
+        else:
+            logger.debug("Turnstile verification successful for IP: %s", remote_ip)
+
+        return success
+    except requests.exceptions.Timeout:
+        logger.error("Turnstile verification timeout after %s seconds", settings.TURNSTILE_TIMEOUT)
+        return False
+    except requests.exceptions.RequestException as e:
+        logger.error("Turnstile verification request failed: %s", str(e))
+        return False
     except Exception as e:
-        logger.exception("Turnstile verification error: %s", e)
+        logger.exception("Turnstile verification unexpected error: %s", e)
         return False
 
 
@@ -544,8 +564,18 @@ def run_scan(payload: ScanRequest, request: Request):
     user_agent = request.headers.get("user-agent")
 
     # --- CAPTCHA enforcement (anti-abuse)
-    if not verify_turnstile(payload.captchaToken, client_ip):
-     raise HTTPException(status_code=400, detail="Captcha verification failed")
+    captcha_valid = verify_turnstile(payload.captchaToken, client_ip)
+    if not captcha_valid:
+        logger.warning(
+            "Scan rejected due to failed captcha: biz=%s ip=%s",
+            payload.businessName,
+            client_ip,
+            extra={"request_id": request_id, "scan_id": scan_id_str}
+        )
+        raise HTTPException(
+            status_code=400,
+            detail="CAPTCHA verification failed. Please refresh the page and try again."
+        )
 
 
     logger.info(
