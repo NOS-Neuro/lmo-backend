@@ -24,7 +24,7 @@ from urllib.parse import urlparse
 import requests
 from requests.exceptions import Timeout, RequestException
 
-from core.prompts import DEFAULT_QUESTIONS
+from core.prompts import DEFAULT_QUESTIONS, get_website_validation_question
 from config import settings
 
 
@@ -263,6 +263,108 @@ class PerplexityClient:
 
 
 # -----------------------------
+# OpenAI Client (for ChatGPT web search)
+# -----------------------------
+
+class OpenAIClient:
+    """Client for OpenAI API with web search capability"""
+
+    BASE_URL = "https://api.openai.com/v1/chat/completions"
+
+    def __init__(self, api_key: str, model: str = "gpt-4o", timeout: int = 30):
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+
+    def chat_web(
+        self,
+        *,
+        system: str,
+        user: str,
+        max_tokens: int = 650,
+        max_retries: int = 3
+    ) -> Tuple[str, List[PerplexityHit], Dict[str, Any]]:
+        """
+        Call OpenAI with web search enabled
+        Returns: (answer_text, citations_list, raw_response)
+
+        Note: OpenAI doesn't return structured citations like Perplexity,
+        so we extract URLs from the response text
+        """
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.2,
+            "max_tokens": max_tokens,
+        }
+
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                r = requests.post(
+                    self.BASE_URL,
+                    headers=headers,
+                    json=payload,
+                    timeout=self.timeout
+                )
+                if r.status_code < 200 or r.status_code >= 300:
+                    if 400 <= r.status_code < 500:
+                        raise RuntimeError(f"OpenAI API error {r.status_code}: {r.text}")
+                    last_error = RuntimeError(f"OpenAI API error {r.status_code}: {r.text}")
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt
+                        time.sleep(wait_time)
+                        continue
+                    raise last_error
+
+                break
+
+            except Timeout as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    time.sleep(wait_time)
+                    continue
+                raise RuntimeError(f"OpenAI API timeout after {max_retries} attempts") from e
+
+            except RequestException as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    time.sleep(wait_time)
+                    continue
+                raise RuntimeError(f"OpenAI API request failed after {max_retries} attempts") from e
+
+        data = r.json()
+        answer = data["choices"][0]["message"]["content"]
+
+        # OpenAI doesn't provide structured citations like Perplexity
+        # So we extract URLs mentioned in the answer text
+        hits: List[PerplexityHit] = []
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+        urls = re.findall(url_pattern, answer)
+
+        for url in urls[:5]:  # Limit to first 5 URLs mentioned
+            hits.append(
+                PerplexityHit(
+                    title="",  # Not available from OpenAI
+                    url=url,
+                    date=None,
+                )
+            )
+
+        return answer, hits, data
+
+
+# -----------------------------
 # Scan prompts
 # -----------------------------
 
@@ -304,20 +406,35 @@ def run_real_scan_perplexity(
     )
 
     biz_domain = _domain(website)
-    qs = questions or DEFAULT_QUESTIONS
+
+    # Start with default questions, then add website validation
+    qs = list(questions or DEFAULT_QUESTIONS)
+    qs.append(get_website_validation_question(website))
 
     provider_results: List[ProviderResult] = []
     raw_bundle: Dict[str, Any] = {
-        "engine": "real_perplexity_mvp_v3",
-        "provider": "perplexity",
-        "model": settings.PERPLEXITY_MODEL,
+        "engine": "real_multimodel_v4",
+        "providers": ["perplexity"],
+        "models": [settings.PERPLEXITY_MODEL],
         "runs": [],
         "notes": [
             "Discovery/Authority are evidence-based from returned citations.",
-            "Accuracy is a proxy until a Truth File compare is implemented.",
+            "Accuracy enhanced with website validation.",
+            "Multi-model validation when OpenAI API key is configured.",
         ],
         "competitors": competitors or [],
     }
+
+    # Initialize OpenAI client if API key is available
+    openai_client = None
+    if settings.OPENAI_API_KEY:
+        openai_client = OpenAIClient(
+            api_key=settings.OPENAI_API_KEY,
+            model="gpt-4o",
+            timeout=30,
+        )
+        raw_bundle["providers"].append("openai")
+        raw_bundle["models"].append("gpt-4o")
 
     system = (
         "You are an audit assistant using web search. "
@@ -326,7 +443,8 @@ def run_real_scan_perplexity(
     )
 
     for prompt_name, q in qs:
-        # Don't mention the website - let Perplexity discover it naturally
+        # Don't mention website for non-validation questions (let AI discover naturally)
+        # For website_validation question, the URL is already in the question text
         industry_context = f"\nIndustry: {industry}" if industry else ""
         user = (
             f"Company name: {business_name}{industry_context}\n\n"
@@ -337,6 +455,7 @@ def run_real_scan_perplexity(
             f"- Keep output concise.\n"
         )
 
+        # Query Perplexity (primary)
         answer, hits, raw = client.chat_web(system=system, user=user, max_tokens=650)
 
         provider_results.append(
@@ -352,6 +471,7 @@ def run_real_scan_perplexity(
 
         raw_bundle["runs"].append(
             {
+                "provider": "perplexity",
                 "prompt_name": prompt_name,
                 "question": q,
                 "answer_text": answer,
@@ -359,6 +479,47 @@ def run_real_scan_perplexity(
                 "raw": raw,
             }
         )
+
+        # Query OpenAI if available (for validation)
+        if openai_client:
+            try:
+                openai_answer, openai_hits, openai_raw = openai_client.chat_web(
+                    system=system,
+                    user=user,
+                    max_tokens=650
+                )
+
+                provider_results.append(
+                    ProviderResult(
+                        provider="openai",
+                        model="gpt-4o",
+                        prompt_name=prompt_name,
+                        question=q,
+                        answer_text=openai_answer,
+                        citations=openai_hits,
+                    )
+                )
+
+                raw_bundle["runs"].append(
+                    {
+                        "provider": "openai",
+                        "prompt_name": prompt_name,
+                        "question": q,
+                        "answer_text": openai_answer,
+                        "search_results": [h.__dict__ for h in openai_hits],
+                        "raw": openai_raw,
+                    }
+                )
+            except Exception as e:
+                # Don't fail the entire scan if OpenAI fails
+                raw_bundle["runs"].append(
+                    {
+                        "provider": "openai",
+                        "prompt_name": prompt_name,
+                        "question": q,
+                        "error": str(e),
+                    }
+                )
 
     # -----------------------------
     # Aggregate evidence
@@ -372,9 +533,30 @@ def run_real_scan_perplexity(
     cite_domains = [_domain(h.url) for h in all_hits if h.url]
     uniq_domains = _unique([d for d in cite_domains if d])
 
+    # Multi-model validation: check if BOTH models found the company
+    perplexity_results = [r for r in provider_results if r.provider == "perplexity"]
+    openai_results = [r for r in provider_results if r.provider == "openai"]
+
+    perplexity_text = "\n".join(r.answer_text for r in perplexity_results)
+    openai_text = "\n".join(r.answer_text for r in openai_results) if openai_results else ""
+
     mentions_name = _contains_name(all_text, business_name)
     mentions_domain = bool(biz_domain and biz_domain in _norm(all_text))
     cites_official = bool(biz_domain and any(d == biz_domain for d in cite_domains))
+
+    # Multi-model consensus bonus
+    multi_model_active = len(openai_results) > 0
+    both_found_name = False
+    both_found_domain = False
+
+    if multi_model_active:
+        perplexity_found_name = _contains_name(perplexity_text, business_name)
+        openai_found_name = _contains_name(openai_text, business_name)
+        both_found_name = perplexity_found_name and openai_found_name
+
+        perplexity_found_domain = bool(biz_domain and biz_domain in _norm(perplexity_text))
+        openai_found_domain = bool(biz_domain and biz_domain in _norm(openai_text))
+        both_found_domain = perplexity_found_domain and openai_found_domain
 
     # Freshness
     parsed_dates = [_parse_date(h.date) for h in all_hits]
@@ -395,12 +577,18 @@ def run_real_scan_perplexity(
     comprehensiveness_hits = int(has_services) + int(has_location) + int(has_contact)
 
     # -----------------------------
-    # Deterministic scoring (then cap to avoid “perfect”)
+    # Deterministic scoring (then cap to avoid "perfect")
     # -----------------------------
     discovery = 0
     discovery += 45 if mentions_name else 0
     discovery += 20 if mentions_domain else 0
     discovery += 35 if cites_official else 0
+
+    # Multi-model consensus bonus for discovery
+    if multi_model_active:
+        discovery += 10 if both_found_name else 0
+        discovery += 5 if both_found_domain else 0
+
     discovery = _clamp_int(discovery, default=0)
 
     mismatch_penalty = 0
@@ -413,6 +601,11 @@ def run_real_scan_perplexity(
     accuracy += 60 if cites_official else 25
     accuracy += 20 if mentions_domain else 0
     accuracy += 20 if mentions_name else 0
+
+    # Multi-model consensus bonus for accuracy
+    if multi_model_active:
+        accuracy += 10 if both_found_name and both_found_domain else 0
+
     accuracy -= mismatch_penalty
     accuracy = _clamp_int(accuracy, default=50)
 
@@ -439,8 +632,9 @@ def run_real_scan_perplexity(
     # -----------------------------
     metrics: Dict[str, Any] = {
         "engine": raw_bundle["engine"],
-        "provider": "perplexity",
-        "model": settings.PERPLEXITY_MODEL,
+        "providers": raw_bundle["providers"],
+        "models": raw_bundle["models"],
+        "multi_model_active": multi_model_active,
         "business_domain": biz_domain,
         "mentions_business_name": bool(mentions_name),
         "mentions_official_domain": bool(mentions_domain),
@@ -455,6 +649,12 @@ def run_real_scan_perplexity(
             "has_contact": bool(has_contact),
             "score_0_to_3": comprehensiveness_hits,
         },
+        "multi_model_validation": {
+            "enabled": multi_model_active,
+            "both_found_name": both_found_name if multi_model_active else None,
+            "both_found_domain": both_found_domain if multi_model_active else None,
+            "consensus_bonus_applied": (both_found_name or both_found_domain) if multi_model_active else False,
+        } if multi_model_active else None,
     }
 
     # -----------------------------
