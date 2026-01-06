@@ -24,8 +24,12 @@ from urllib.parse import urlparse
 import requests
 from requests.exceptions import Timeout, RequestException
 
-from core.prompts import DEFAULT_QUESTIONS
+from core.prompts import DEFAULT_QUESTIONS, get_identity_questions
 from config import settings
+import logging
+import json
+
+logger = logging.getLogger("vizai")
 
 
 # -----------------------------
@@ -124,6 +128,141 @@ def _parse_date(d: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(d.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def _extract_capitalized_names(text: str) -> List[str]:
+    """Extract capitalized name candidates from text (for conflict detection)"""
+    # Simple heuristic: find sequences of 2+ capitalized words
+    pattern = r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b'
+    return re.findall(pattern, text)
+
+
+def _count_unclear_responses(provider_results: List[ProviderResult]) -> Tuple[int, float]:
+    """Count how many responses contain 'unclear' or similar"""
+    unclear_count = 0
+    for r in provider_results:
+        answer_lower = r.answer_text.lower()
+        if 'unclear' in answer_lower or 'not available' in answer_lower or 'no information' in answer_lower:
+            unclear_count += 1
+
+    unclear_rate = unclear_count / len(provider_results) if provider_results else 0.0
+    return unclear_count, unclear_rate
+
+
+# -----------------------------
+# Entity Match Gate (Identity Confidence)
+# -----------------------------
+
+def compute_entity_identity(
+    *,
+    submitted_domain: str,
+    business_name: str,
+    perplexity_results: List[ProviderResult],
+    all_text: str
+) -> Dict[str, Any]:
+    """
+    Compute entity identity confidence from Perplexity evidence ONLY.
+    Returns identity gate structure for raw_bundle["identity"].
+    """
+    # Collect all citation domains
+    all_domains: List[str] = []
+    for r in perplexity_results:
+        for hit in r.citations:
+            if hit.url:
+                domain = _domain(hit.url)
+                if domain:
+                    all_domains.append(domain)
+
+    # Count domain frequencies
+    domain_counts: Dict[str, int] = {}
+    for d in all_domains:
+        domain_counts[d] = domain_counts.get(d, 0) + 1
+
+    # Get dominant domains (top 10 by citation count)
+    sorted_domains = sorted(domain_counts.items(), key=lambda x: x[1], reverse=True)
+    dominant_citation_domains = [d for d, _ in sorted_domains[:10]]
+
+    # Check if submitted domain appears in citations or answers
+    submitted_cited = submitted_domain in all_domains
+    submitted_mentioned = submitted_domain in _norm(all_text)
+
+    # Detect official domain from evidence
+    official_domain_detected = submitted_domain if (submitted_cited or submitted_mentioned) else ""
+
+    # If submitted domain not found, try to infer from most-cited domain
+    if not official_domain_detected and dominant_citation_domains:
+        # Check if top domain is described as "official" in answers
+        top_domain = dominant_citation_domains[0]
+        if "official" in _norm(all_text) and top_domain in _norm(all_text):
+            official_domain_detected = top_domain
+
+    # Name conflict detection: look for other capitalized names
+    name_candidates = _extract_capitalized_names(all_text)
+    name_lower = _norm(business_name)
+
+    # Filter out the actual business name from candidates
+    conflict_candidates = [
+        name for name in name_candidates
+        if _norm(name) != name_lower and len(name) > 3
+    ]
+
+    # Count unique conflict candidates (limit to top 5)
+    conflict_counts: Dict[str, int] = {}
+    for name in conflict_candidates:
+        conflict_counts[name] = conflict_counts.get(name, 0) + 1
+    top_conflicts = sorted(conflict_counts.items(), key=lambda x: x[1], reverse=True)[:5]
+    name_conflict_candidates = [name for name, _ in top_conflicts]
+
+    # Compute unclear rate
+    _, unclear_rate = _count_unclear_responses(perplexity_results)
+
+    # Compute entity confidence (0-100)
+    confidence = 100
+
+    # Penalties
+    if not submitted_cited:
+        confidence -= 30  # Major penalty if official domain never cited
+    if not submitted_mentioned:
+        confidence -= 15  # Penalty if domain not even mentioned
+    if not _contains_name(all_text, business_name):
+        confidence -= 25  # Major penalty if business name not found
+    if len(name_conflict_candidates) > 2:
+        confidence -= 20  # Many conflicting names detected
+    if unclear_rate > 0.3:
+        confidence -= 15  # High unclear rate
+    if len(dominant_citation_domains) < 3:
+        confidence -= 10  # Very few citation sources
+
+    confidence = _clamp_int(confidence, default=50, lo=0, hi=100)
+
+    # Determine entity status
+    if confidence >= 80 and submitted_cited:
+        entity_status = "CONFIRMED"
+    elif confidence >= 60:
+        entity_status = "LIKELY"
+    elif confidence >= 40:
+        entity_status = "UNCLEAR"
+    else:
+        entity_status = "MISMATCH"
+
+    # If official domain detected doesn't match submitted, downgrade status
+    if official_domain_detected and official_domain_detected != submitted_domain:
+        if entity_status == "CONFIRMED":
+            entity_status = "LIKELY"
+        elif entity_status == "LIKELY":
+            entity_status = "UNCLEAR"
+
+    return {
+        "submitted_domain": submitted_domain,
+        "official_domain_detected": official_domain_detected,
+        "entity_confidence": confidence,
+        "entity_status": entity_status,
+        "dominant_citation_domains": dominant_citation_domains,
+        "name_conflict_candidates": name_conflict_candidates,
+        "unclear_rate": round(unclear_rate, 3),
+        "submitted_domain_cited": submitted_cited,
+        "submitted_domain_mentioned": submitted_mentioned,
+    }
 
 
 # -----------------------------
@@ -263,6 +402,141 @@ class PerplexityClient:
 
 
 # -----------------------------
+<<<<<<< Updated upstream
+=======
+# OpenAI Validator (evidence consistency checker ONLY)
+# -----------------------------
+
+VALIDATOR_PROMPT = """You are a fact-checking validator. You will be given:
+1. A question that was asked
+2. An answer from another AI system (Perplexity)
+3. A list of citation URLs/domains that were used as sources
+
+Your job is to evaluate whether the answer is well-supported by the citations provided.
+
+RULES:
+- You MUST NOT add new facts, sources, or URLs
+- You MUST NOT browse the web or search for information
+- You MUST ONLY evaluate the consistency and support of the given answer using the provided citations
+- Return ONLY valid JSON (no markdown, no explanation)
+
+Output format (STRICT JSON ONLY):
+{
+  "confidence_0_to_1": <float between 0 and 1>,
+  "consistency_score_0_to_100": <integer 0-100>,
+  "red_flags": [<list of string concerns if any>],
+  "missing_expected_items": [<list of string items that should be present but aren't>]
+}
+
+Evaluation criteria:
+- confidence_0_to_1: How confident are you the answer is supported by the citations? (0.0 = no support, 1.0 = fully supported)
+- consistency_score_0_to_100: Overall consistency score (0 = inconsistent/unsupported, 100 = fully consistent)
+- red_flags: List any concerns (e.g., "answer claims X but no citation supports it", "conflicting information")
+- missing_expected_items: What key facts are missing that you'd expect given the question?
+"""
+
+
+class OpenAIValidator:
+    """
+    OpenAI-based validator for checking Perplexity answer consistency.
+    Does NOT discover facts - only validates existing evidence.
+    """
+
+    BASE_URL = "https://api.openai.com/v1/chat/completions"
+
+    def __init__(self, api_key: str, model: str = "gpt-4o-mini", timeout: int = 15):
+        self.api_key = api_key
+        self.model = model
+        self.timeout = timeout
+
+    def validate_answer(
+        self,
+        *,
+        question: str,
+        answer: str,
+        citations: List[str],
+        official_domain: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Validate a Perplexity answer against its citations.
+        Returns validation result dict or None if validation fails.
+        """
+        # Build context for validator
+        citations_text = "\n".join([f"- {url}" for url in citations])
+        official_context = f"\nOfficial domain (if known): {official_domain}" if official_domain else ""
+
+        user_prompt = f"""Question: {question}
+
+Answer to validate:
+{answer}
+
+Citations provided:
+{citations_text}{official_context}
+
+Evaluate the answer's support from these citations only. Return JSON only."""
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": VALIDATOR_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 300,
+            "response_format": {"type": "json_object"},
+        }
+
+        try:
+            r = requests.post(
+                self.BASE_URL,
+                headers=headers,
+                json=payload,
+                timeout=self.timeout
+            )
+
+            if r.status_code != 200:
+                logger.warning(f"OpenAI validator API error {r.status_code}: {r.text[:200]}")
+                return None
+
+            data = r.json()
+            response_text = data["choices"][0]["message"]["content"]
+
+            # Parse JSON response
+            result = json.loads(response_text)
+
+            # Validate structure
+            if not isinstance(result.get("confidence_0_to_1"), (int, float)):
+                logger.warning("Validator returned invalid confidence format")
+                return None
+
+            if not isinstance(result.get("consistency_score_0_to_100"), int):
+                logger.warning("Validator returned invalid consistency_score format")
+                return None
+
+            # Clamp values
+            result["confidence_0_to_1"] = max(0.0, min(1.0, float(result["confidence_0_to_1"])))
+            result["consistency_score_0_to_100"] = max(0, min(100, int(result["consistency_score_0_to_100"])))
+
+            return result
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Validator returned invalid JSON: {e}")
+            return None
+        except Timeout:
+            logger.warning("OpenAI validator timeout")
+            return None
+        except Exception as e:
+            logger.warning(f"OpenAI validator error: {e}")
+            return None
+
+
+# -----------------------------
+>>>>>>> Stashed changes
 # Scan prompts
 # -----------------------------
 
