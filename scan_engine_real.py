@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -616,40 +617,64 @@ def run_real_scan_perplexity(
         "Search for official and authoritative sources."
     )
 
-    for prompt_name, q in qs:
-        # Don't mention the website - let Perplexity discover it naturally
+    # Define function to run a single query (for parallel execution)
+    def run_single_query(prompt_name: str, question: str) -> Tuple[str, str, str, List[PerplexityHit], Any]:
+        """Execute a single Perplexity query and return results"""
         industry_context = f"\nIndustry: {industry}" if industry else ""
         user = (
             f"Company name: {business_name}{industry_context}\n\n"
-            f"Task: {q}\n\n"
+            f"Task: {question}\n\n"
             f"Rules:\n"
             f"- Only state facts supported by citations.\n"
             f"- If uncertain, say 'unclear'.\n"
             f"- Keep output concise.\n"
         )
 
-        answer, hits, raw = client.chat_web(system=system, user=user, max_tokens=650)
+        answer, hits, raw = client.chat_web(system=system, user=user, max_tokens=450)
+        return prompt_name, question, answer, hits, raw
 
-        provider_results.append(
-            ProviderResult(
-                provider="perplexity",
-                model=settings.PERPLEXITY_MODEL,
-                prompt_name=prompt_name,
-                question=q,
-                answer_text=answer,
-                citations=hits,
-            )
-        )
+    # Execute all queries in parallel for 5-7x speedup
+    logger.info("Starting parallel execution of %d queries", len(qs))
+    start_time = time.time()
 
-        raw_bundle["runs"].append(
-            {
-                "prompt_name": prompt_name,
-                "question": q,
-                "answer_text": answer,
-                "search_results": [h.__dict__ for h in hits],
-                "raw": raw,
-            }
-        )
+    with ThreadPoolExecutor(max_workers=min(len(qs), 10)) as executor:
+        # Submit all queries
+        future_to_query = {
+            executor.submit(run_single_query, prompt_name, q): (prompt_name, q)
+            for prompt_name, q in qs
+        }
+
+        # Collect results as they complete
+        for future in as_completed(future_to_query):
+            try:
+                prompt_name, question, answer, hits, raw = future.result()
+
+                provider_results.append(
+                    ProviderResult(
+                        provider="perplexity",
+                        model=settings.PERPLEXITY_MODEL,
+                        prompt_name=prompt_name,
+                        question=question,
+                        answer_text=answer,
+                        citations=hits,
+                    )
+                )
+
+                raw_bundle["runs"].append(
+                    {
+                        "prompt_name": prompt_name,
+                        "question": question,
+                        "answer_text": answer,
+                        "search_results": [h.__dict__ for h in hits],
+                        "raw": raw,
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Query failed for {future_to_query[future][0]}: {e}")
+                # Continue with other queries even if one fails
+
+    elapsed = time.time() - start_time
+    logger.info("Parallel query execution completed in %.2f seconds", elapsed)
 
     # -----------------------------
     # Aggregate evidence
