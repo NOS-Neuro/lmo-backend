@@ -287,6 +287,21 @@ def test_cors_origins_follow_settings(monkeypatch):
     assert main.settings.cors_allowed_origins == ["https://vizai.io", "https://www.vizai.io"]
 
 
+def test_run_scan_preflight_allows_known_frontend_origin():
+    response = request_json(
+        main.app,
+        "OPTIONS",
+        "/run_scan",
+        headers={
+            "origin": "https://vizai.app",
+            "access-control-request-method": "POST",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "https://vizai.app"
+
+
 def test_contact_request_email_copy_is_clean(monkeypatch):
     sent = {}
 

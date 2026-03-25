@@ -88,7 +88,7 @@ class Settings(BaseSettings):
 
     # Frontend settings
     FRONTEND_ORIGIN: str = Field(
-        default="http://localhost:3000",
+        default="http://localhost:3000,https://vizai.io,https://www.vizai.io,https://vizai.app",
         description="Frontend origin for CORS (no wildcard allowed)"
     )
 
