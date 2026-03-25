@@ -284,7 +284,19 @@ def test_get_scan_competitors_returns_rows(monkeypatch):
 def test_cors_origins_follow_settings(monkeypatch):
     monkeypatch.setattr(main.settings, "FRONTEND_ORIGIN", "https://vizai.io, https://www.vizai.io")
 
-    assert main.settings.cors_allowed_origins == ["https://vizai.io", "https://www.vizai.io"]
+    assert main.settings.cors_allowed_origins == [
+        "http://localhost:3000",
+        "https://vizai.io",
+        "https://www.vizai.io",
+        "https://vizai.app",
+    ]
+
+
+def test_cors_origins_keep_repo_defaults_when_env_is_narrow(monkeypatch):
+    monkeypatch.setattr(main.settings, "FRONTEND_ORIGIN", "http://localhost:3000")
+
+    assert "https://vizai.app" in main.settings.cors_allowed_origins
+    assert "https://vizai.io" in main.settings.cors_allowed_origins
 
 
 def test_run_scan_preflight_allows_known_frontend_origin():

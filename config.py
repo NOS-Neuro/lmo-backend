@@ -8,6 +8,13 @@ from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator
 
+DEFAULT_CORS_ORIGINS = (
+    "http://localhost:3000",
+    "https://vizai.io",
+    "https://www.vizai.io",
+    "https://vizai.app",
+)
+
 
 class Settings(BaseSettings):
     """Application settings with validation."""
@@ -88,7 +95,7 @@ class Settings(BaseSettings):
 
     # Frontend settings
     FRONTEND_ORIGIN: str = Field(
-        default="http://localhost:3000,https://vizai.io,https://www.vizai.io,https://vizai.app",
+        default=",".join(DEFAULT_CORS_ORIGINS),
         description="Frontend origin for CORS (no wildcard allowed)"
     )
 
@@ -145,8 +152,13 @@ class Settings(BaseSettings):
 
     @property
     def cors_allowed_origins(self) -> list[str]:
-        """Return normalized CORS origins from FRONTEND_ORIGIN."""
-        return [origin.strip() for origin in self.FRONTEND_ORIGIN.split(",") if origin.strip()]
+        """Return normalized CORS origins from FRONTEND_ORIGIN plus repo-known safe defaults."""
+        merged: list[str] = []
+        for origin in list(DEFAULT_CORS_ORIGINS) + self.FRONTEND_ORIGIN.split(","):
+            normalized = origin.strip()
+            if normalized and normalized not in merged:
+                merged.append(normalized)
+        return merged
 
     @property
     def email_notifications_enabled(self) -> bool:
