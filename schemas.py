@@ -50,10 +50,19 @@ class QAPair(BaseModel):
 class ScanResponse(BaseModel):
     scan_id: Optional[str] = None
     created_at: Optional[str] = None
+    ai_visibility_score: Optional[int] = None
     discovery_score: int
     accuracy_score: int
     authority_score: int
     overall_score: int
+    visibility_status: Optional[str] = None
+    confidence_level: Optional[str] = None
+    evidence_summary: Optional[str] = None
+    verified_facts: Optional[List[str]] = None
+    unclear_facts: Optional[List[str]] = None
+    missing_signals: Optional[List[str]] = None
+    limitations: Optional[List[str]] = None
+    proof_signals: Optional[List[str]] = None
     package_recommendation: str
     package_explanation: str
     strategy_summary: str
@@ -64,8 +73,8 @@ class ScanResponse(BaseModel):
     entity_confidence: Optional[int] = None
     warnings: Optional[List[str]] = None
     disclaimer: str = (
-        "This scan is evidence-based when run in Real Scan mode. "
-        "Fallback mode is an honest AI-assisted estimate."
+        "This scan shows how AI systems identify, verify, and cite a business. "
+        "It is not a business ranking. Fallback mode is an honest AI-assisted estimate."
     )
 
 

@@ -56,10 +56,19 @@ class ProviderResult:
 
 @dataclass
 class RealScanResult:
+    ai_visibility_score: int
     discovery_score: int
     accuracy_score: int
     authority_score: int
     overall_score: int
+    visibility_status: str
+    confidence_level: str
+    evidence_summary: str
+    verified_facts: List[str]
+    unclear_facts: List[str]
+    missing_signals: List[str]
+    limitations: List[str]
+    proof_signals: List[str]
 
     package_recommendation: str
     package_explanation: str
@@ -89,8 +98,14 @@ def _clamp_int(v: Any, default: int = 50, lo: int = 0, hi: int = 100) -> int:
 
 def _domain(url: str) -> str:
     try:
-        host = urlparse(url).netloc.lower().strip()
-        return host.lstrip("www.")
+        parsed = urlparse((url or "").strip())
+        host = parsed.netloc or parsed.path
+        host = host.strip().lower()
+        if "/" in host:
+            host = host.split("/", 1)[0]
+        if host.startswith("www."):
+            host = host[4:]
+        return host
     except Exception:
         return ""
 
@@ -153,6 +168,212 @@ def _count_unclear_responses(provider_results: List[ProviderResult]) -> Tuple[in
 
     unclear_rate = unclear_count / len(provider_results) if provider_results else 0.0
     return unclear_count, unclear_rate
+
+
+def _extract_coverage_signals(provider_results: List[ProviderResult]) -> Dict[str, bool]:
+    texts = [_norm(r.answer_text) for r in provider_results]
+    services_patterns = [
+        r"\bservices include\b",
+        r"\bprovides\b.{0,80}\bservices?\b",
+        r"\boffers\b.{0,80}\bservices?\b",
+        r"\bspecializes in\b",
+        r"\bprimary services\b",
+        r"\bservice lines\b",
+    ]
+    location_patterns = [
+        r"\bbased in\s+[a-z]",
+        r"\bheadquartered in\s+[a-z]",
+        r"\blocated in\s+[a-z]",
+        r"\boperates in\s+[a-z]",
+        r"\bservice area\b",
+        r"\bregions served\b",
+    ]
+    contact_patterns = [
+        r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
+        r"\+\d[\d\s().-]{7,}",
+        r"\bcontact page\b",
+        r"\bcontact us\b",
+        r"\bphone:\b",
+        r"\bemail:\b",
+        r"\btelephone\b",
+    ]
+
+    has_services = any(any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in services_patterns) for text in texts)
+    has_location = any(any(re.search(pattern, text, flags=re.IGNORECASE) for pattern in location_patterns) for text in texts)
+    has_contact = any(any(re.search(pattern, r.answer_text or "", flags=re.IGNORECASE) for pattern in contact_patterns) for r in provider_results)
+
+    return {
+        "has_services": has_services,
+        "has_location": has_location,
+        "has_contact": has_contact,
+    }
+
+
+def _extract_proof_signals(provider_results: List[ProviderResult]) -> List[str]:
+    proof_patterns = {
+        "certifications": [r"\bcertified\b", r"\biso\s?\d{3,5}\b", r"\bsoc\s?2\b", r"\bcompliance\b"],
+        "awards": [r"\baward\b", r"\bawarded\b", r"\bwinner\b", r"\brecognized by\b"],
+        "partnerships": [r"\bpartnership with\b", r"\bpartnered with\b", r"\bofficial partner\b"],
+        "testimonials": [r"\btestimonial\b", r"\bcustomer review\b", r"\bclient review\b"],
+        "case_studies": [r"\bcase study\b", r"\bcustomer story\b", r"\bsuccess story\b"],
+    }
+    all_text = "\n".join(r.answer_text or "" for r in provider_results)
+    found: List[str] = []
+    for label, patterns in proof_patterns.items():
+        if any(re.search(pattern, all_text, flags=re.IGNORECASE) for pattern in patterns):
+            found.append(label)
+    return found
+
+
+def _prompt_summary(prompt_name: str, question: str) -> str:
+    mapping = {
+        "website_validation": "Whether the submitted website is the official site",
+        "identity_fingerprint": "Core identity details such as HQ, phone, and primary services",
+        "baseline_overview": "A concise description of what the business does",
+        "founder_team": "Founder and leadership details",
+        "recent_activity": "Recent activity and updates",
+        "social_proof": "Scale, customers, or measurable proof",
+        "locations_scope": "Where the business operates",
+        "competitive_position": "How the business is positioned in its market",
+        "proof_points": "Proof points such as certifications, awards, partnerships, or case studies",
+    }
+    return mapping.get(prompt_name, question.strip())
+
+
+def _build_visibility_confidence(
+    *,
+    query_success_count: int,
+    query_error_count: int,
+    entity_status: str,
+    entity_confidence: int,
+    unclear_rate: float,
+    citation_count: int,
+    unique_citation_domain_count: int,
+    cites_official_domain: bool,
+    validator_supported_count: int,
+    validator_total_count: int,
+) -> Tuple[int, str]:
+    total_queries = query_success_count + query_error_count
+    success_rate = (query_success_count / total_queries) if total_queries else 0.0
+
+    confidence_score = 20
+    confidence_score += int(success_rate * 25)
+    confidence_score += min(int(entity_confidence * 0.25), 25)
+    confidence_score += min(citation_count, 10)
+    confidence_score += min(unique_citation_domain_count * 2, 10)
+    if cites_official_domain:
+        confidence_score += 10
+    if validator_total_count:
+        confidence_score += int((validator_supported_count / validator_total_count) * 10)
+    if unclear_rate > 0.5:
+        confidence_score -= 20
+    elif unclear_rate > 0.3:
+        confidence_score -= 10
+    if query_error_count:
+        confidence_score -= min(query_error_count * 5, 15)
+    if entity_status == "MISMATCH":
+        confidence_score -= 20
+    elif entity_status == "UNCLEAR":
+        confidence_score -= 10
+
+    confidence_score = _clamp_int(confidence_score, default=20, lo=0, hi=100)
+    if confidence_score >= 75:
+        return confidence_score, "high"
+    if confidence_score >= 55:
+        return confidence_score, "medium"
+    if confidence_score >= 35:
+        return confidence_score, "low"
+    return confidence_score, "insufficient"
+
+
+def _build_public_summary(
+    *,
+    business_name: str,
+    business_domain: str,
+    overall_score: int,
+    confidence_level: str,
+    query_success_count: int,
+    query_error_count: int,
+    entity_status: str,
+    entity_confidence: int,
+    cites_official_domain: bool,
+    has_services: bool,
+    has_location: bool,
+    has_contact: bool,
+    proof_signals: List[str],
+    provider_results: List[ProviderResult],
+    validator_supported_count: int,
+    validator_total_count: int,
+) -> Dict[str, Any]:
+    if confidence_level == "insufficient" or entity_status in {"UNCLEAR", "MISMATCH"}:
+        visibility_status = "insufficient_evidence"
+    elif overall_score >= 80 and cites_official_domain:
+        visibility_status = "clearly_seen"
+    elif overall_score >= 55:
+        visibility_status = "partially_seen"
+    else:
+        visibility_status = "weakly_seen"
+
+    verified_facts: List[str] = []
+    if _contains_name("\n".join(r.answer_text for r in provider_results), business_name):
+        verified_facts.append("AI identified the business name in returned answers.")
+    if cites_official_domain:
+        verified_facts.append(f"AI cited the official domain: {business_domain}.")
+    if has_services:
+        verified_facts.append("AI found a clear description of the business's services.")
+    if has_location:
+        verified_facts.append("AI found an explicit operating location or service area.")
+    if has_contact:
+        verified_facts.append("AI found a concrete contact path such as email, phone, or contact page.")
+    if proof_signals:
+        verified_facts.append(f"AI found citeable proof signals: {', '.join(proof_signals)}.")
+
+    unclear_facts = [
+        _prompt_summary(r.prompt_name, r.question)
+        for r in provider_results
+        if "unclear" in (r.answer_text or "").lower() or "not available" in (r.answer_text or "").lower() or "no information" in (r.answer_text or "").lower()
+    ]
+    unclear_facts = _unique(unclear_facts)
+
+    missing_signals: List[str] = []
+    if not cites_official_domain:
+        missing_signals.append("Official domain citations")
+    if not has_services:
+        missing_signals.append("Clear service descriptions")
+    if not has_location:
+        missing_signals.append("Explicit operating location or service area")
+    if not has_contact:
+        missing_signals.append("Concrete contact details")
+    if not proof_signals:
+        missing_signals.append("Proof points such as certifications, awards, partnerships, testimonials, or case studies")
+
+    limitations: List[str] = []
+    if query_error_count:
+        limitations.append(f"{query_error_count} scan question(s) timed out or failed, so the scan is partial.")
+    if confidence_level in {"low", "insufficient"}:
+        limitations.append("Evidence was thin or inconsistent, so confidence is limited.")
+    if entity_status in {"UNCLEAR", "MISMATCH"}:
+        limitations.append(f"Entity identification was {entity_status.lower()}, which limits certainty.")
+    if validator_total_count and validator_supported_count < validator_total_count:
+        limitations.append("Some answers were not strongly supported by the validator layer.")
+    if not limitations:
+        limitations.append("No major evidence limitations were detected in this scan.")
+
+    evidence_summary = (
+        f"AI visibility is {visibility_status.replace('_', ' ')} with {confidence_level} confidence. "
+        f"{query_success_count} query result(s) succeeded and {query_error_count} failed. "
+        f"Entity status is {entity_status.lower()} ({entity_confidence}/100). "
+        f"{'The official domain was cited.' if cites_official_domain else 'The official domain was not cited.'}"
+    )
+
+    return {
+        "visibility_status": visibility_status,
+        "verified_facts": verified_facts[:6],
+        "unclear_facts": unclear_facts[:6],
+        "missing_signals": missing_signals[:6],
+        "limitations": limitations[:6],
+        "evidence_summary": evidence_summary,
+    }
 
 
 # -----------------------------
@@ -787,12 +1008,13 @@ def run_real_scan_perplexity(
             newest = newest.replace(tzinfo=timezone.utc)
         freshest_days = max(0, int((now - newest).total_seconds() // 86400))
 
-    # Comprehensiveness heuristics
-    t = _norm(all_text)
-    has_services = any(k in t for k in ["services", "solutions", "we provide", "offerings"])
-    has_location = any(k in t for k in ["located", "based in", "headquartered", "operations", "serve"])
-    has_contact = any(k in t for k in ["contact", "email", "phone", "reach", "sales"])
+    # Conservative coverage + proof extraction
+    coverage = _extract_coverage_signals(provider_results)
+    has_services = coverage["has_services"]
+    has_location = coverage["has_location"]
+    has_contact = coverage["has_contact"]
     comprehensiveness_hits = int(has_services) + int(has_location) + int(has_contact)
+    proof_signals = _extract_proof_signals(provider_results)
 
     # -----------------------------
     # Deterministic scoring (then cap to avoid “perfect”)
@@ -901,6 +1123,28 @@ def run_real_scan_perplexity(
     # Final clamp
     overall = _clamp_int(overall, default=50, lo=0, hi=100)
 
+    validator_supported_count = 0
+    validator_total_count = 0
+    for validation_run in raw_bundle["validation"]["runs"]:
+        validation = validation_run.get("validation") or {}
+        validator_total_count += 1
+        verdict = str(validation.get("verdict") or "").lower()
+        if verdict in {"supported", "mostly_supported"}:
+            validator_supported_count += 1
+
+    confidence_score, confidence_level = _build_visibility_confidence(
+        query_success_count=raw_bundle["timings"]["query_success_count"],
+        query_error_count=raw_bundle["timings"]["query_error_count"],
+        entity_status=entity_status,
+        entity_confidence=entity_confidence,
+        unclear_rate=unclear_rate,
+        citation_count=len(all_hits),
+        unique_citation_domain_count=len(uniq_domains),
+        cites_official_domain=bool(cites_official),
+        validator_supported_count=validator_supported_count,
+        validator_total_count=validator_total_count,
+    )
+
     # -----------------------------
     # Metrics
     # -----------------------------
@@ -923,11 +1167,24 @@ def run_real_scan_perplexity(
             "has_contact": bool(has_contact),
             "score_0_to_3": comprehensiveness_hits,
         },
+        "proof_signals": proof_signals,
         "entity_identity": {
             "status": entity_status,
             "confidence": entity_confidence,
             "unclear_rate": unclear_rate,
             "submitted_domain_cite_count": submitted_domain_cite_count,
+        },
+        "query_health": {
+            "success_count": raw_bundle["timings"]["query_success_count"],
+            "error_count": raw_bundle["timings"]["query_error_count"],
+        },
+        "validator_summary": {
+            "supported_count": validator_supported_count,
+            "total_count": validator_total_count,
+        },
+        "visibility_confidence": {
+            "score": confidence_score,
+            "level": confidence_level,
         },
         "gating_warnings": warnings,
     }
@@ -949,10 +1206,17 @@ def run_real_scan_perplexity(
             scores={"discovery": int(discovery), "accuracy": int(accuracy), "authority": int(authority)},
         )
 
+        package = rec_bundle.recommended_package
+        explanation = rec_bundle.package_explanation
+        strategy = rec_bundle.strategy_summary
+
         metrics["recommendations"] = {
             "fix_now": [r.__dict__ for r in rec_bundle.fix_now],
             "maintain": [r.__dict__ for r in rec_bundle.maintain],
             "next_scan_focus": rec_bundle.next_scan_focus,
+            "recommended_package": rec_bundle.recommended_package,
+            "package_explanation": rec_bundle.package_explanation,
+            "strategy_summary": rec_bundle.strategy_summary,
         }
         raw_bundle["recommendations"] = metrics["recommendations"]
 
@@ -963,8 +1227,28 @@ def run_real_scan_perplexity(
     # -----------------------------
     # Findings (specific / variable)
     # -----------------------------
+    public_summary = _build_public_summary(
+        business_name=business_name,
+        business_domain=biz_domain,
+        overall_score=int(overall),
+        confidence_level=confidence_level,
+        query_success_count=raw_bundle["timings"]["query_success_count"],
+        query_error_count=raw_bundle["timings"]["query_error_count"],
+        entity_status=entity_status,
+        entity_confidence=entity_confidence,
+        cites_official_domain=bool(cites_official),
+        has_services=bool(has_services),
+        has_location=bool(has_location),
+        has_contact=bool(has_contact),
+        proof_signals=proof_signals,
+        provider_results=provider_results,
+        validator_supported_count=validator_supported_count,
+        validator_total_count=validator_total_count,
+    )
+
     findings: List[str] = []
-    findings.append("Real scan completed with web-backed answers + captured citations.")
+    findings.append("VizAI assessed how AI systems identify, verify, and cite this business.")
+    findings.append(public_summary["evidence_summary"])
 
     if cites_official:
         findings.append("Official site is being cited by sources (good canonical signal).")
@@ -999,7 +1283,19 @@ def run_real_scan_perplexity(
     if isinstance(recs, list) and recs:
         findings.append(f"Next focus: {recs[0]}.")
 
+    metrics["public_summary"] = {
+        "visibility_status": public_summary["visibility_status"],
+        "confidence_level": confidence_level,
+        "evidence_summary": public_summary["evidence_summary"],
+        "verified_facts": public_summary["verified_facts"],
+        "unclear_facts": public_summary["unclear_facts"],
+        "missing_signals": public_summary["missing_signals"],
+        "limitations": public_summary["limitations"],
+        "proof_signals": proof_signals,
+    }
+
     raw_bundle["metrics"] = metrics
+    raw_bundle["public_summary"] = metrics["public_summary"]
     raw_bundle["package"] = {
         "recommendation": package,
         "explanation": explanation,
@@ -1021,10 +1317,19 @@ def run_real_scan_perplexity(
     )
 
     result = RealScanResult(
+        ai_visibility_score=int(overall),
         discovery_score=int(discovery),
         accuracy_score=int(accuracy),
         authority_score=int(authority),
         overall_score=int(overall),
+        visibility_status=public_summary["visibility_status"],
+        confidence_level=confidence_level,
+        evidence_summary=public_summary["evidence_summary"],
+        verified_facts=public_summary["verified_facts"],
+        unclear_facts=public_summary["unclear_facts"],
+        missing_signals=public_summary["missing_signals"],
+        limitations=public_summary["limitations"],
+        proof_signals=proof_signals,
         package_recommendation=package,
         package_explanation=explanation,
         strategy_summary=strategy,

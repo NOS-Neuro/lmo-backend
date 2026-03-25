@@ -119,10 +119,19 @@ class FakeConnection:
 
 def make_scan_result():
     return SimpleNamespace(
+        ai_visibility_score=79,
         discovery_score=81,
         accuracy_score=79,
         authority_score=77,
         overall_score=79,
+        visibility_status="partially_seen",
+        confidence_level="medium",
+        evidence_summary="AI visibility is partially seen with medium confidence.",
+        verified_facts=["AI identified the business name in returned answers."],
+        unclear_facts=["Recent activity and updates"],
+        missing_signals=["Official domain citations"],
+        limitations=["Evidence was thin or inconsistent, so confidence is limited."],
+        proof_signals=["certifications"],
         package_recommendation="Standard LMO",
         package_explanation="Explanation",
         strategy_summary="Strategy",
@@ -183,7 +192,11 @@ def test_run_scan_persists_before_sending_email(monkeypatch):
 
     assert response.status_code == 200
     assert events == ["insert", "email"]
-    assert response.json()["email_sent"] is False
+    body = response.json()
+    assert body["email_sent"] is False
+    assert body["ai_visibility_score"] == 79
+    assert body["visibility_status"] == "partially_seen"
+    assert body["confidence_level"] == "medium"
 
 
 def test_run_scan_async_mode_returns_processing(monkeypatch):
@@ -362,6 +375,18 @@ def test_get_scan_status_completed_returns_result(monkeypatch):
             "package_explanation": "Explanation",
             "strategy_summary": "Strategy",
             "findings": ["Finding 1"],
+            "raw_llm": {
+                "public_summary": {
+                    "visibility_status": "partially_seen",
+                    "confidence_level": "medium",
+                    "evidence_summary": "AI visibility is partially seen with medium confidence.",
+                    "verified_facts": ["AI identified the business name in returned answers."],
+                    "unclear_facts": ["Recent activity and updates"],
+                    "missing_signals": ["Official domain citations"],
+                    "limitations": ["Evidence was thin or inconsistent, so confidence is limited."],
+                    "proof_signals": ["certifications"],
+                }
+            },
             "email_sent": False,
         },
     )
@@ -372,6 +397,8 @@ def test_get_scan_status_completed_returns_result(monkeypatch):
     body = response.json()
     assert body["status"] == "completed"
     assert body["result"]["overall_score"] == 79
+    assert body["result"]["visibility_status"] == "partially_seen"
+    assert body["result"]["confidence_level"] == "medium"
 
 
 def test_cors_origins_follow_settings(monkeypatch):

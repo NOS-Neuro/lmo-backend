@@ -130,13 +130,23 @@ def get_scan_status(scan_id: str):
     }
 
     if status == "completed":
+        public_summary = ((record.get("raw_llm") or {}).get("public_summary") or {})
         response["result"] = {
             "scan_id": scan_id,
             "created_at": response["created_at"],
+            "ai_visibility_score": int(record["overall_score"] or 0),
             "discovery_score": int(record["discovery_score"] or 0),
             "accuracy_score": int(record["accuracy_score"] or 0),
             "authority_score": int(record["authority_score"] or 0),
             "overall_score": int(record["overall_score"] or 0),
+            "visibility_status": public_summary.get("visibility_status"),
+            "confidence_level": public_summary.get("confidence_level"),
+            "evidence_summary": public_summary.get("evidence_summary"),
+            "verified_facts": list(public_summary.get("verified_facts") or []),
+            "unclear_facts": list(public_summary.get("unclear_facts") or []),
+            "missing_signals": list(public_summary.get("missing_signals") or []),
+            "limitations": list(public_summary.get("limitations") or []),
+            "proof_signals": list(public_summary.get("proof_signals") or []),
             "package_recommendation": str(record["package_recommendation"] or ""),
             "package_explanation": str(record["package_explanation"] or ""),
             "strategy_summary": str(record["strategy_summary"] or ""),

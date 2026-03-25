@@ -238,6 +238,55 @@ class TestBuildRecommendationsP1:
         assert p1_authority[0].priority == "P1"
         assert "authority" in p1_authority[0].title.lower() or "dependency" in p1_authority[0].title.lower()
 
+    def test_package_recommendation_is_gap_driven(self):
+        evidence = Evidence(
+            business_domain="example.com",
+            cites_official_domain=False,
+            mentions_business_name=True,
+            mentions_official_domain=False,
+            citation_count=1,
+            unique_citation_domains=["directory.example"],
+            freshest_cited_days=None,
+            has_services=False,
+            has_location=False,
+            has_contact=False,
+            proof_signals=[],
+            query_success_count=2,
+            query_error_count=2,
+            entity_status="UNCLEAR",
+            entity_confidence=42,
+            unclear_rate=0.5,
+        )
+
+        signals = Signals(
+            official_source_missing=True,
+            low_domain_diversity=True,
+            high_domain_diversity=False,
+            authority_dependency_risk=True,
+            freshness_unknown=True,
+            freshness_stale=False,
+            freshness_recent=False,
+            missing_services=True,
+            missing_location=True,
+            missing_contact=True,
+            proof_points_missing=True,
+            thin_evidence=True,
+            partial_results=True,
+            confidence_limited=True,
+            mentions_business_name=True,
+            mentions_official_domain=False,
+            cites_official_domain=False,
+        )
+
+        bundle = build_recommendations(
+            evidence=evidence,
+            signals=signals,
+            scores={"discovery": 78, "accuracy": 76, "authority": 74},
+        )
+
+        assert bundle.recommended_package == "Standard LMO + Add-Ons"
+        assert "verify" in bundle.package_explanation.lower() or "evidence" in bundle.package_explanation.lower()
+
     def test_recommendation_copy_uses_ascii_punctuation(self):
         evidence = Evidence(
             business_domain="example.com",

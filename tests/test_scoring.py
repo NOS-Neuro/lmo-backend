@@ -19,7 +19,12 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scan_engine_real import derive_recommendation, run_real_scan_perplexity
+from scan_engine_real import (
+    _domain,
+    _extract_coverage_signals,
+    derive_recommendation,
+    run_real_scan_perplexity,
+)
 import scan_engine_real
 from core.ras.scoring import interpret
 
@@ -288,6 +293,8 @@ def test_run_real_scan_perplexity_allows_partial_results_and_records_timings(mon
     assert raw_bundle["timings"]["query_error_count"] == 1
     assert raw_bundle["timings"]["queries"][0]["status"] in {"ok", "error"}
     assert "total_seconds" in raw_bundle["timings"]
+    assert result.confidence_level in {"low", "medium", "high", "insufficient"}
+    assert result.visibility_status in {"clearly_seen", "partially_seen", "weakly_seen", "insufficient_evidence"}
 
 
 def test_run_real_scan_perplexity_raises_when_all_queries_fail(monkeypatch):
@@ -305,6 +312,56 @@ def test_run_real_scan_perplexity_raises_when_all_queries_fail(monkeypatch):
             website="https://acme.com",
             questions=[("q1", "Question 1")],
         )
+
+
+def test_domain_normalization_preserves_real_hostname():
+    assert _domain("https://www.vizai.io/about") == "vizai.io"
+    assert _domain(" https://Vizai.io ") == "vizai.io"
+    assert _domain("https://www2.example.com") == "www2.example.com"
+    assert _domain("https://wexample.com") == "wexample.com"
+
+
+def test_conservative_coverage_extraction_avoids_weak_keyword_matches():
+    provider_results = [
+        scan_engine_real.ProviderResult(
+            provider="perplexity",
+            model="sonar-pro",
+            prompt_name="competitive_position",
+            question="Q1",
+            answer_text="The company serves enterprise buyers and has a sales-led motion.",
+            citations=[],
+        )
+    ]
+
+    coverage = _extract_coverage_signals(provider_results)
+
+    assert coverage["has_location"] is False
+    assert coverage["has_contact"] is False
+    assert coverage["has_services"] is False
+
+
+def test_thin_evidence_produces_insufficient_or_low_confidence(monkeypatch):
+    monkeypatch.setattr(scan_engine_real.settings, "PERPLEXITY_API_KEY", "test-key")
+    monkeypatch.setattr(scan_engine_real.settings, "OPENAI_API_KEY", None)
+
+    def fake_chat_web(self, *, system, user, max_tokens=650, max_retries=None):
+        return (
+            "Acme Corp is unclear.",
+            [],
+            {"ok": True},
+        )
+
+    monkeypatch.setattr(scan_engine_real.PerplexityClient, "chat_web", fake_chat_web)
+
+    result, raw_bundle = run_real_scan_perplexity(
+        business_name="Acme Corp",
+        website="https://acme.com",
+        questions=[("q1", "Question 1"), ("q2", "Question 2")],
+    )
+
+    assert result.confidence_level in {"low", "insufficient"}
+    assert result.visibility_status == "insufficient_evidence"
+    assert "Official domain citations" in result.missing_signals
 
     def test_boundary_case_exactly_80(self):
         """Exactly 80 should be Basic LMO"""

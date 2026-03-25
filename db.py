@@ -389,6 +389,7 @@ def get_scan_record(scan_id: uuid.UUID) -> Optional[Dict[str, Any]]:
                     package_explanation,
                     strategy_summary,
                     findings,
+                    raw_llm,
                     email_sent,
                     scan_status,
                     completed_at,
@@ -414,10 +415,11 @@ def get_scan_record(scan_id: uuid.UUID) -> Optional[Dict[str, Any]]:
             "package_explanation": row[7],
             "strategy_summary": row[8],
             "findings": row[9],
-            "email_sent": row[10],
-            "scan_status": row[11],
-            "completed_at": row[12],
-            "failure_message": row[13],
+            "raw_llm": row[10],
+            "email_sent": row[11],
+            "scan_status": row[12],
+            "completed_at": row[13],
+            "failure_message": row[14],
         }
     finally:
         return_db_conn(conn)

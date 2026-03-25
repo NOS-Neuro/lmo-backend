@@ -29,6 +29,9 @@ class RecommendationBundle:
     fix_now: List[Recommendation]
     maintain: List[Recommendation]
     next_scan_focus: List[str]
+    recommended_package: str = "Standard LMO"
+    package_explanation: str = ""
+    strategy_summary: str = ""
 
 
 def _rec(
@@ -146,6 +149,23 @@ def build_recommendations(
             why=["Scan evidence: contact path was unclear or missing."],
         ))
 
+    if signals.proof_points_missing:
+        recs_fix.append(_rec(
+            id="proof_points_missing",
+            rec_type="fix",
+            priority="P1",
+            category="Proof",
+            title="Publish proof points AI can verify and cite",
+            action_steps=[
+                "Add evidence-backed proof pages for certifications, awards, partnerships, case studies, or testimonials.",
+                "Make each proof asset independently citeable on the official domain.",
+                "Link proof pages from core service pages so AI systems can connect claims to evidence.",
+            ],
+            expected_impact="Improves how confidently AI systems can support claims with citations.",
+            measurable_outcome="Next scan finds verifiable proof signals in citations and summaries.",
+            why=["Scan evidence: proof-oriented claims were thin or not clearly verifiable."],
+        ))
+
     # -------------------------
     # P1: Authority dependency risk
     # -------------------------
@@ -252,9 +272,59 @@ def build_recommendations(
         focus.append("Increase authoritative profiles that cite official domain")
     if signals.freshness_stale or signals.freshness_unknown:
         focus.append("Improve freshness signals")
+    if signals.proof_points_missing:
+        focus.append("Publish citeable proof points")
+
+    severe_visibility_gap = (
+        signals.official_source_missing or
+        signals.thin_evidence or
+        signals.confidence_limited
+    )
+    major_gap_count = sum(
+        [
+            int(signals.missing_services),
+            int(signals.missing_location),
+            int(signals.missing_contact),
+            int(signals.authority_dependency_risk),
+            int(signals.proof_points_missing),
+        ]
+    )
+
+    if severe_visibility_gap and (major_gap_count >= 2 or not evidence.cites_official_domain):
+        recommended_package = "Standard LMO + Add-Ons"
+        package_explanation = (
+            "AI systems do not yet have enough strong, verifiable evidence to identify and describe this business reliably. "
+            "You need canonical source repair plus proof-building to improve AI visibility."
+        )
+        strategy_summary = (
+            "Start with canonical source, structured data, and proof pages. "
+            "Then add authority seeding and re-scan after the official site becomes citeable."
+        )
+    elif severe_visibility_gap or major_gap_count >= 1 or signals.partial_results:
+        recommended_package = "Standard LMO"
+        package_explanation = (
+            "AI can partially identify the business, but important facts are unclear, weakly cited, or missing. "
+            "This package focuses on making the business easier for AI systems to verify."
+        )
+        strategy_summary = (
+            "Tighten About, Services, location, contact, and proof coverage. "
+            "Add schema and improve the mix of authoritative sources that cite the official domain."
+        )
+    else:
+        recommended_package = "Basic LMO"
+        package_explanation = (
+            "AI already sees the business clearly with usable citations. "
+            "This package is for monitoring drift and keeping evidence fresh."
+        )
+        strategy_summary = (
+            "Maintain canonical pages, keep proof assets current, and re-scan periodically to catch visibility drift."
+        )
 
     return RecommendationBundle(
         fix_now=recs_fix[:8],
         maintain=recs_maintain[:6],
         next_scan_focus=focus[:3],
+        recommended_package=recommended_package,
+        package_explanation=package_explanation,
+        strategy_summary=strategy_summary,
     )
