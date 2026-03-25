@@ -237,7 +237,10 @@ def test_run_scan_db_failure_returns_generic_error_and_skips_email(monkeypatch):
     response = request_json(main.app, "POST", "/run_scan", payload=make_payload())
 
     assert response.status_code == 500
-    assert response.json() == {"error": "Unable to store scan results. Please try again."}
+    assert response.json() == {
+        "error": "Unable to store scan results. Please try again.",
+        "detail": "Unable to store scan results. Please try again.",
+    }
     assert email_calls == []
 
 
@@ -256,10 +259,13 @@ def test_run_scan_scan_failure_returns_generic_error(monkeypatch):
     response = request_json(main.app, "POST", "/run_scan", payload=make_payload())
 
     assert response.status_code == 500
-    assert response.json() == {"error": "Scan processing failed. Please try again."}
+    assert response.json() == {
+        "error": "Scan processing failed. Please try again.",
+        "detail": "Scan processing failed. Please try again.",
+    }
 
 
-def test_run_scan_rate_limit_uses_forwarded_for(monkeypatch):
+def test_run_scan_rate_limit_ignores_spoofed_forwarded_for_by_default(monkeypatch):
     reset_limiter()
     configure_scan_success(monkeypatch)
 
@@ -268,6 +274,32 @@ def test_run_scan_rate_limit_uses_forwarded_for(monkeypatch):
     monkeypatch.setattr(main.settings, "RESEND_API_KEY", None)
     monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_FROM", None)
     monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_TO", None)
+    monkeypatch.setattr(main.settings, "TRUST_PROXY_HEADERS", False)
+
+    headers_one = {"x-forwarded-for": "1.1.1.1"}
+    headers_two = {"x-forwarded-for": "2.2.2.2"}
+
+    for _ in range(10):
+        response = request_json(main.app, "POST", "/run_scan", payload=make_payload(), headers=headers_one)
+        assert response.status_code == 200
+
+    limited = request_json(main.app, "POST", "/run_scan", payload=make_payload(), headers=headers_one)
+    separate_ip = request_json(main.app, "POST", "/run_scan", payload=make_payload(), headers=headers_two)
+
+    assert limited.status_code == 429
+    assert separate_ip.status_code == 429
+
+
+def test_run_scan_rate_limit_can_use_forwarded_for_when_proxy_headers_are_trusted(monkeypatch):
+    reset_limiter()
+    configure_scan_success(monkeypatch)
+
+    monkeypatch.setattr(routes, "verify_turnstile", lambda token, remote_ip=None: True)
+    monkeypatch.setattr(main.settings, "DATABASE_URL", None)
+    monkeypatch.setattr(main.settings, "RESEND_API_KEY", None)
+    monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_FROM", None)
+    monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_TO", None)
+    monkeypatch.setattr(main.settings, "TRUST_PROXY_HEADERS", True)
 
     headers_one = {"x-forwarded-for": "1.1.1.1"}
     headers_two = {"x-forwarded-for": "2.2.2.2"}
@@ -281,6 +313,40 @@ def test_run_scan_rate_limit_uses_forwarded_for(monkeypatch):
 
     assert limited.status_code == 429
     assert separate_ip.status_code == 200
+
+
+def test_send_scan_emails_persists_email_status(monkeypatch):
+    persisted = []
+
+    monkeypatch.setattr(main.settings, "DATABASE_URL", "postgres://db")
+    monkeypatch.setattr(main.settings, "RESEND_API_KEY", "resend-key")
+    monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_FROM", "from@example.com")
+    monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_TO", "to@example.com")
+    monkeypatch.setattr(scan_service, "send_scan_results_email", lambda **kwargs: True)
+    monkeypatch.setattr(scan_service, "update_scan_email_status", lambda **kwargs: persisted.append(kwargs))
+
+    scan_service.send_scan_emails_in_background(
+        payload=SimpleNamespace(
+            contactEmail="owner@acme.com",
+            businessName="Acme Corp",
+            requestContact=False,
+            website="https://acme.com",
+            industry="Software",
+        ),
+        result=SimpleNamespace(
+            discovery_score=81,
+            accuracy_score=79,
+            authority_score=77,
+            overall_score=79,
+            findings=["Finding 1"],
+            package_recommendation="Standard LMO",
+            strategy_summary="Strategy",
+        ),
+        scan_id=uuid4(),
+        request_id="req123",
+    )
+
+    assert persisted and persisted[0]["email_sent"] is True
 
 
 def test_health_hides_db_identity(monkeypatch):

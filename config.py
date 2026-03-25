@@ -104,6 +104,10 @@ class Settings(BaseSettings):
         default=",".join(DEFAULT_CORS_ORIGINS),
         description="Frontend origin for CORS (no wildcard allowed)"
     )
+    TRUST_PROXY_HEADERS: bool = Field(
+        default=False,
+        description="Trust proxy-forwarded client IP headers for rate limiting/logging"
+    )
 
     # Logging
     LOG_LEVEL: str = Field(

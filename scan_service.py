@@ -16,6 +16,7 @@ from db import (
     insert_competitor_scan,
     insert_main_scan,
     mark_scan_failed,
+    update_scan_email_status,
     update_main_scan_result,
 )
 from email_service import send_contact_request_notification, send_scan_results_email
@@ -30,21 +31,23 @@ def _duration_ms(start_time: float) -> int:
 
 
 def get_client_ip_from_request(request: Request) -> str:
-    """Extract the best-effort client IP, accounting for common proxy headers."""
-    forwarded = request.headers.get("x-forwarded-for")
-    real_ip = request.headers.get("x-real-ip")
-    cf_ip = request.headers.get("cf-connecting-ip")
-
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    if real_ip:
-        return real_ip.strip()
-    if cf_ip:
-        return cf_ip.strip()
+    """Extract the client IP, using forwarded headers only when explicitly trusted."""
     client = getattr(request, "client", None)
-    if client and client.host:
-        return client.host
-    return get_remote_address(request) or "unknown"
+    direct_ip = client.host if client and client.host else get_remote_address(request)
+
+    if settings.TRUST_PROXY_HEADERS:
+        forwarded = request.headers.get("x-forwarded-for")
+        real_ip = request.headers.get("x-real-ip")
+        cf_ip = request.headers.get("cf-connecting-ip")
+
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        if real_ip:
+            return real_ip.strip()
+        if cf_ip:
+            return cf_ip.strip()
+
+    return direct_ip or "unknown"
 
 
 def get_rate_limit_key(request: Request) -> str:
@@ -104,6 +107,7 @@ def send_scan_emails_in_background(
     request_id: str,
 ) -> None:
     """Run non-critical email side effects after the response is returned."""
+    email_sent = False
     try:
         email_sent = send_scan_results_email(
             to_email=str(payload.contactEmail),
@@ -141,6 +145,16 @@ def send_scan_emails_in_background(
             str(e),
             extra={"request_id": request_id, "scan_id": str(scan_id)[:8]},
         )
+    finally:
+        if settings.DATABASE_URL:
+            try:
+                update_scan_email_status(scan_id=scan_id, email_sent=email_sent)
+            except Exception as e:
+                logger.error(
+                    "Failed to persist email status: %s",
+                    str(e),
+                    extra={"request_id": request_id, "scan_id": str(scan_id)[:8]},
+                )
 
 
 def process_competitor_scans_in_background(

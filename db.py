@@ -333,6 +333,31 @@ def update_main_scan_result(
         return_db_conn(conn)
 
 
+def update_scan_email_status(*, scan_id: uuid.UUID, email_sent: bool) -> None:
+    if not settings.DATABASE_URL:
+        return
+
+    conn = None
+    try:
+        conn = get_db_conn()
+        if not conn:
+            raise RuntimeError("DB unavailable (no connection from pool)")
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE vizai_scans
+                SET email_sent = %s
+                WHERE scan_id = %s
+                """,
+                (bool(email_sent), str(scan_id)),
+            )
+        conn.commit()
+        logger.info("Updated email status for scan %s: sent=%s", str(scan_id), bool(email_sent))
+    finally:
+        return_db_conn(conn)
+
+
 def mark_scan_failed(
     *,
     scan_id: uuid.UUID,
