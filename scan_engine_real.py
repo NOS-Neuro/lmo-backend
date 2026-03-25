@@ -349,21 +349,21 @@ def _build_public_summary(
 
     limitations: List[str] = []
     if query_error_count:
-        limitations.append(f"{query_error_count} scan question(s) timed out or failed, so the scan is partial.")
+        limitations.append(f"{query_error_count} scan question(s) timed out or failed, so this is a partial read of AI visibility.")
     if confidence_level in {"low", "insufficient"}:
-        limitations.append("Evidence was thin or inconsistent, so confidence is limited.")
+        limitations.append("The available evidence was thin or inconsistent, so confidence is limited.")
     if entity_status in {"UNCLEAR", "MISMATCH"}:
-        limitations.append(f"Entity identification was {entity_status.lower()}, which limits certainty.")
+        limitations.append(f"Entity matching was {entity_status.lower()}, which limits how confidently facts can be attributed to this business.")
     if validator_total_count and validator_supported_count < validator_total_count:
-        limitations.append("Some answers were not strongly supported by the validator layer.")
+        limitations.append("Some answer summaries were not strongly supported by the validator layer.")
     if not limitations:
         limitations.append("No major evidence limitations were detected in this scan.")
 
     evidence_summary = (
-        f"AI visibility is {visibility_status.replace('_', ' ')} with {confidence_level} confidence. "
+        f"VizAI found {visibility_status.replace('_', ' ')} visibility with {confidence_level} confidence. "
         f"{query_success_count} query result(s) succeeded and {query_error_count} failed. "
-        f"Entity status is {entity_status.lower()} ({entity_confidence}/100). "
-        f"{'The official domain was cited.' if cites_official_domain else 'The official domain was not cited.'}"
+        f"Entity matching is {entity_status.lower()} ({entity_confidence}/100). "
+        f"{'The official domain was cited in the evidence.' if cites_official_domain else 'The official domain was not cited in the evidence.'}"
     )
 
     return {
@@ -502,32 +502,32 @@ def derive_recommendation(discovery: int, accuracy: int, authority: int) -> Tupl
     if overall >= 80:
         package = "Basic LMO"
         explanation = (
-            "You're in a strong baseline position. Basic is about monitoring drift, "
-            "tightening a few signals, and keeping answers stable as sources change."
+            "AI systems can already identify the business and support the core profile with relatively strong evidence. "
+            "Basic is for monitoring drift and tightening weaker verification points."
         )
         strategy = (
-            "Lock a canonical Truth File, verify schema/metadata, and run scheduled rechecks "
-            "to catch drift early. Add 1-2 authority assets if needed."
+            "Maintain canonical pages, keep schema and metadata current, and re-check visibility after major updates. "
+            "Add 1-2 stronger proof assets only where evidence is still thin."
         )
     elif overall >= 40:
         package = "Standard LMO"
         explanation = (
-            "AI can likely find you, but gaps or inconsistencies reduce reliability. "
-            "Standard closes gaps and strengthens signals AI uses to describe you correctly."
+            "AI can identify part of the business, but some claims are weakly supported, inconsistently described, or hard to verify. "
+            "Standard focuses on making the profile clearer and more citeable."
         )
         strategy = (
-            "Improve About/Services/FAQ, deploy schema, and seed a small set of authoritative profiles. "
-            "Then re-scan and compare deltas."
+            "Tighten About, Services, FAQ, contact, and location coverage, add structured data, and strengthen the source mix that points back to the official site. "
+            "Then re-scan and compare what AI can verify more confidently."
         )
     else:
         package = "Standard LMO + Add-Ons"
         explanation = (
-            "AI visibility is weak or fragmented. You'll need foundational correction plus targeted "
-            "authority building to correct the record quickly."
+            "AI visibility is weak, fragmented, or poorly supported by evidence. "
+            "This path is for rebuilding the canonical source and adding proof where AI systems currently cannot verify key claims."
         )
         strategy = (
-            "Start with a Truth File + schema deployment, then add authority seeding and directory cleanup. "
-            "Re-scan weekly until stable."
+            "Start with canonical source repair, structured data, and proof pages, then add authority seeding and listing cleanup. "
+            "Re-scan until AI can identify and verify the business more reliably."
         )
 
     return overall, package, explanation, strategy
@@ -1058,19 +1058,19 @@ def run_real_scan_perplexity(
 
     # Entity status gates
     if entity_status in {"UNCLEAR", "MISMATCH"}:
-        warnings.append(f"Entity status is {entity_status} - overall score capped at 60")
+        warnings.append(f"Entity match is {entity_status}; visibility score capped at 60 because attribution is uncertain.")
 
     if official_domain_detected and official_domain_detected != biz_domain:
-        warnings.append(f"Domain mismatch detected: submitted '{biz_domain}' vs detected '{official_domain_detected}' - overall score capped at 70")
+        warnings.append(f"Submitted domain '{biz_domain}' does not match the domain most strongly supported by the evidence ('{official_domain_detected}'); visibility score capped at 70.")
 
     if not submitted_domain_cited:
-        warnings.append("Submitted domain was never cited - discovery/accuracy/authority penalties applied")
+        warnings.append("The submitted domain was never cited, so visibility and verification strength were reduced.")
 
     # Unclear rate penalties
     if unclear_rate > 0.50:
-        warnings.append(f"High unclear rate ({unclear_rate:.1%}) - overall score capped at 65")
+        warnings.append(f"A high share of answers were unclear ({unclear_rate:.1%}); visibility score capped at 65.")
     elif unclear_rate > 0.30:
-        warnings.append(f"Moderate unclear rate ({unclear_rate:.1%}) - overall score capped at 75")
+        warnings.append(f"A meaningful share of answers were unclear ({unclear_rate:.1%}); visibility score capped at 75.")
 
     # Apply proportional accuracy reduction based on unclear rate
     accuracy_unclear_penalty = int(unclear_rate * 30)  # Max -30 points at 100% unclear
@@ -1109,16 +1109,16 @@ def run_real_scan_perplexity(
         # Must meet ALL requirements for 90+
         if entity_status != "CONFIRMED":
             overall = min(overall, 85)
-            warnings.append("90+ requires CONFIRMED entity status - capped at 85")
+            warnings.append("A 90+ visibility score requires confirmed entity matching; capped at 85.")
         if submitted_domain_cite_count < 2:
             overall = min(overall, 85)
-            warnings.append("90+ requires domain cited 2+ times - capped at 85")
+            warnings.append("A 90+ visibility score requires the official domain to be cited at least twice; capped at 85.")
         if len(uniq_domains) < 6:
             overall = min(overall, 85)
-            warnings.append("90+ requires 6+ unique citation domains - capped at 85")
+            warnings.append("A 90+ visibility score requires at least 6 unique citation domains; capped at 85.")
         if unclear_rate >= 0.20:
             overall = min(overall, 85)
-            warnings.append("90+ requires unclear rate < 20% - capped at 85")
+            warnings.append("A 90+ visibility score requires fewer unclear answers; capped at 85.")
 
     # Final clamp
     overall = _clamp_int(overall, default=50, lo=0, hi=100)
@@ -1247,25 +1247,25 @@ def run_real_scan_perplexity(
     )
 
     findings: List[str] = []
-    findings.append("VizAI assessed how AI systems identify, verify, and cite this business.")
+    findings.append("VizAI assessed how AI systems identify this business, what they can verify, and where evidence is weak.")
     findings.append(public_summary["evidence_summary"])
 
     if cites_official:
-        findings.append("Official site is being cited by sources (good canonical signal).")
+        findings.append("AI responses cited the official site, which strengthens attribution and verification.")
     else:
-        findings.append("Official site was NOT cited - AI may rely on third-party sources.")
+        findings.append("AI responses did not cite the official site, so the model may be relying on weaker third-party sources.")
 
-    findings.append(f"Unique citation domains observed: {len(uniq_domains)}")
+    findings.append(f"Unique citation domains observed: {len(uniq_domains)}.")
 
     if freshest_days is None:
-        findings.append("Freshness signals: citation dates not provided by sources.")
+        findings.append("Source freshness could not be checked because citation dates were not provided.")
     else:
         if freshest_days <= 30:
-            findings.append(f"Freshness signals: recent (~{freshest_days} days).")
+            findings.append(f"The freshest cited source appears recent at roughly {freshest_days} days old.")
         elif freshest_days <= 90:
-            findings.append(f"Freshness signals: moderately current (~{freshest_days} days).")
+            findings.append(f"The freshest cited source appears moderately current at roughly {freshest_days} days old.")
         else:
-            findings.append(f"Freshness signals: stale (~{freshest_days} days).")
+            findings.append(f"The freshest cited source appears stale at roughly {freshest_days} days old.")
 
     coverage_bits: List[str] = []
     if has_services:
@@ -1275,13 +1275,13 @@ def run_real_scan_perplexity(
     if has_contact:
         coverage_bits.append("contact")
     findings.append(
-        f"Coverage signals detected: {len(coverage_bits)}/3 "
+        f"AI could clearly verify {len(coverage_bits)}/3 core coverage areas "
         f"({('/'.join(coverage_bits)) if coverage_bits else 'none'})."
     )
 
     recs = (metrics.get("recommendations") or {}).get("next_scan_focus")
     if isinstance(recs, list) and recs:
-        findings.append(f"Next focus: {recs[0]}.")
+        findings.append(f"Highest-value next fix: {recs[0]}.")
 
     metrics["public_summary"] = {
         "visibility_status": public_summary["visibility_status"],

@@ -73,7 +73,7 @@ class ScanResponse(BaseModel):
     entity_confidence: Optional[int] = None
     warnings: Optional[List[str]] = None
     disclaimer: str = (
-        "This scan shows how AI systems identify, verify, and cite a business. "
+        "This scan describes how AI systems currently identify, verify, and cite a business based on the evidence returned. "
         "It is not a business ranking. Fallback mode is an honest AI-assisted estimate."
     )
 

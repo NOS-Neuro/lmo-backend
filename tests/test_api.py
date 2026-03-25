@@ -126,7 +126,7 @@ def make_scan_result():
         overall_score=79,
         visibility_status="partially_seen",
         confidence_level="medium",
-        evidence_summary="AI visibility is partially seen with medium confidence.",
+        evidence_summary="VizAI found partially seen visibility with medium confidence.",
         verified_facts=["AI identified the business name in returned answers."],
         unclear_facts=["Recent activity and updates"],
         missing_signals=["Official domain citations"],
@@ -379,7 +379,7 @@ def test_get_scan_status_completed_returns_result(monkeypatch):
                 "public_summary": {
                     "visibility_status": "partially_seen",
                     "confidence_level": "medium",
-                    "evidence_summary": "AI visibility is partially seen with medium confidence.",
+                    "evidence_summary": "VizAI found partially seen visibility with medium confidence.",
                     "verified_facts": ["AI identified the business name in returned answers."],
                     "unclear_facts": ["Recent activity and updates"],
                     "missing_signals": ["Official domain citations"],

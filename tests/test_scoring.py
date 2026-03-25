@@ -241,7 +241,7 @@ class TestPackageRecommendation:
         overall, package, explanation, strategy = derive_recommendation(discovery, accuracy, authority)
         assert overall >= 80
         assert package == "Basic LMO"
-        assert "maintenance" in explanation.lower() or "strong" in explanation.lower()
+        assert "identify" in explanation.lower() or "evidence" in explanation.lower()
 
     def test_standard_lmo_package(self):
         """40 <= overall < 80 = Standard LMO package"""
@@ -252,7 +252,7 @@ class TestPackageRecommendation:
         overall, package, explanation, strategy = derive_recommendation(discovery, accuracy, authority)
         assert 40 <= overall < 80
         assert package == "Standard LMO"
-        assert "gaps" in explanation.lower() or "strengthens" in explanation.lower()
+        assert "verify" in explanation.lower() or "unclear" in explanation.lower()
 
     def test_standard_lmo_addons_package(self):
         """overall < 40 = Standard LMO + Add-Ons package"""
@@ -263,7 +263,7 @@ class TestPackageRecommendation:
         overall, package, explanation, strategy = derive_recommendation(discovery, accuracy, authority)
         assert overall < 40
         assert "Standard LMO + Add-Ons" in package
-        assert "foundational" in explanation.lower() or "weak" in explanation.lower()
+        assert "evidence" in explanation.lower() or "verify" in explanation.lower()
 
 
 def test_run_real_scan_perplexity_allows_partial_results_and_records_timings(monkeypatch):
@@ -431,11 +431,11 @@ class TestStrategyRecommendations:
 
     def test_strategy_copy_uses_ascii_punctuation(self):
         _, _, explanation, strategy = derive_recommendation(85, 85, 85)
-        assert "You're" in explanation
+        assert "AI systems can already identify" in explanation
         assert "1-2" in strategy
 
         _, _, low_explanation, _ = derive_recommendation(20, 20, 20)
-        assert "You'll" in low_explanation
+        assert "AI visibility is weak" in low_explanation
 
 
 class TestScoreBandCopy:

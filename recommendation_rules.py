@@ -294,27 +294,27 @@ def build_recommendations(
         recommended_package = "Standard LMO + Add-Ons"
         package_explanation = (
             "AI systems do not yet have enough strong, verifiable evidence to identify and describe this business reliably. "
-            "You need canonical source repair plus proof-building to improve AI visibility."
+            "This package is for fixing canonical-source gaps, proof gaps, and weak citations."
         )
         strategy_summary = (
             "Start with canonical source, structured data, and proof pages. "
-            "Then add authority seeding and re-scan after the official site becomes citeable."
+            "Then add stronger external citations and re-scan after the official site becomes easier to verify."
         )
     elif severe_visibility_gap or major_gap_count >= 1 or signals.partial_results:
         recommended_package = "Standard LMO"
         package_explanation = (
-            "AI can partially identify the business, but important facts are unclear, weakly cited, or missing. "
-            "This package focuses on making the business easier for AI systems to verify."
+            "AI can partially identify the business, but important facts are still unclear, weakly cited, or missing. "
+            "This package focuses on making the business easier for AI systems to verify and cite correctly."
         )
         strategy_summary = (
             "Tighten About, Services, location, contact, and proof coverage. "
-            "Add schema and improve the mix of authoritative sources that cite the official domain."
+            "Add schema and improve the mix of authoritative sources that point back to the official domain."
         )
     else:
         recommended_package = "Basic LMO"
         package_explanation = (
             "AI already sees the business clearly with usable citations. "
-            "This package is for monitoring drift and keeping evidence fresh."
+            "This package is for monitoring drift and keeping the evidence base current."
         )
         strategy_summary = (
             "Maintain canonical pages, keep proof assets current, and re-scan periodically to catch visibility drift."
