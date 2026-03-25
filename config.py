@@ -135,12 +135,18 @@ class Settings(BaseSettings):
     @classmethod
     def validate_no_wildcard_origin(cls, v: str) -> str:
         """Prevent wildcard CORS origin."""
-        if v == "*":
+        origins = [origin.strip() for origin in v.split(",") if origin.strip()]
+        if "*" in origins:
             raise ValueError(
                 "FRONTEND_ORIGIN cannot be '*' (wildcard). "
                 "Set explicit origin or leave unset for localhost:3000 default."
             )
         return v
+
+    @property
+    def cors_allowed_origins(self) -> list[str]:
+        """Return normalized CORS origins from FRONTEND_ORIGIN."""
+        return [origin.strip() for origin in self.FRONTEND_ORIGIN.split(",") if origin.strip()]
 
     @property
     def email_notifications_enabled(self) -> bool:
