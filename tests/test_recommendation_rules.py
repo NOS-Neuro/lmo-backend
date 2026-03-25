@@ -238,6 +238,54 @@ class TestBuildRecommendationsP1:
         assert p1_authority[0].priority == "P1"
         assert "authority" in p1_authority[0].title.lower() or "dependency" in p1_authority[0].title.lower()
 
+    def test_recommendation_copy_uses_ascii_punctuation(self):
+        evidence = Evidence(
+            business_domain="example.com",
+            cites_official_domain=True,
+            mentions_business_name=True,
+            mentions_official_domain=True,
+            citation_count=10,
+            unique_citation_domains=["domain1.com"] * 10,
+            freshest_cited_days=20,
+            has_services=False,
+            has_location=False,
+            has_contact=False,
+        )
+
+        signals = Signals(
+            official_source_missing=False,
+            low_domain_diversity=False,
+            high_domain_diversity=False,
+            authority_dependency_risk=True,
+            freshness_unknown=False,
+            freshness_stale=False,
+            freshness_recent=True,
+            missing_services=True,
+            missing_location=True,
+            missing_contact=True,
+            mentions_business_name=True,
+            mentions_official_domain=True,
+            cites_official_domain=True,
+        )
+
+        bundle = build_recommendations(
+            evidence=evidence,
+            signals=signals,
+            scores={"discovery": 50, "accuracy": 50, "authority": 50},
+        )
+
+        services = [r for r in bundle.fix_now if r.id == "coverage_services_missing"][0]
+        location = [r for r in bundle.fix_now if r.id == "coverage_location_missing"][0]
+        contact = [r for r in bundle.fix_now if r.id == "coverage_contact_missing"][0]
+        authority = [r for r in bundle.fix_now if r.id == "authority_dependency_risk"][0]
+
+        assert "'Services'" in services.action_steps[0]
+        assert "5-10" in services.action_steps[0]
+        assert "'Where we operate'" in location.action_steps[0]
+        assert "'ContactPoint'" in contact.action_steps[1]
+        assert "'unclear contact'" in contact.expected_impact
+        assert "2-3" in authority.action_steps[0]
+
 
 class TestBuildRecommendationsP2:
     """Test P2 (medium priority) recommendations"""

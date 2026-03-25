@@ -281,12 +281,12 @@ def derive_recommendation(discovery: int, accuracy: int, authority: int) -> Tupl
     if overall >= 80:
         package = "Basic LMO"
         explanation = (
-            "You’re in a strong baseline position. Basic is about monitoring drift, "
+            "You're in a strong baseline position. Basic is about monitoring drift, "
             "tightening a few signals, and keeping answers stable as sources change."
         )
         strategy = (
             "Lock a canonical Truth File, verify schema/metadata, and run scheduled rechecks "
-            "to catch drift early. Add 1–2 authority assets if needed."
+            "to catch drift early. Add 1-2 authority assets if needed."
         )
     elif overall >= 40:
         package = "Standard LMO"
@@ -301,7 +301,7 @@ def derive_recommendation(discovery: int, accuracy: int, authority: int) -> Tupl
     else:
         package = "Standard LMO + Add-Ons"
         explanation = (
-            "AI visibility is weak or fragmented. You’ll need foundational correction plus targeted "
+            "AI visibility is weak or fragmented. You'll need foundational correction plus targeted "
             "authority building to correct the record quickly."
         )
         strategy = (
@@ -932,7 +932,7 @@ def run_real_scan_perplexity(
     if cites_official:
         findings.append("Official site is being cited by sources (good canonical signal).")
     else:
-        findings.append("Official site was NOT cited — AI may rely on third-party sources.")
+        findings.append("Official site was NOT cited - AI may rely on third-party sources.")
 
     findings.append(f"Unique citation domains observed: {len(uniq_domains)}")
 

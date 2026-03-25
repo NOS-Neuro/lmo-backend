@@ -41,7 +41,7 @@ logger.info("Rate limiting: ENABLED (10 req/min per IP on /run_scan)")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("VizAI API startingâ€¦ DATABASE_URL present=%s", bool(settings.DATABASE_URL))
+    logger.info("VizAI API starting... DATABASE_URL present=%s", bool(settings.DATABASE_URL))
     if settings.DATABASE_URL:
         init_db_pool()
         ensure_tables_and_migrations()

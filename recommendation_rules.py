@@ -103,7 +103,7 @@ def build_recommendations(
             category="Coverage",
             title="Clarify services in machine-readable and human-readable form",
             action_steps=[
-                "Create a ‘Services’ page with 5–10 bullet service lines (plain language).",
+                "Create a 'Services' page with 5-10 bullet service lines (plain language).",
                 "Add FAQ that answers: what you do, who you serve, where you serve, and constraints.",
                 "Add Service schema markup where appropriate.",
             ],
@@ -120,7 +120,7 @@ def build_recommendations(
             category="Coverage",
             title="Remove geographic ambiguity",
             action_steps=[
-                "Add a ‘Where we operate’ section (regions/cities/countries).",
+                "Add a 'Where we operate' section (regions/cities/countries).",
                 "If multiple sites: create Locations page + consistent address formatting.",
                 "Add LocalBusiness schema with address/serviceArea fields.",
             ],
@@ -138,10 +138,10 @@ def build_recommendations(
             title="Make the contact path unambiguous for AI and users",
             action_steps=[
                 "Ensure Contact page includes phone/email/form and is linked in nav/footer.",
-                "Add ‘ContactPoint’ schema (email/telephone/contactType).",
-                "Add ‘Request a quote’ page if B2B sales-driven.",
+                "Add 'ContactPoint' schema (email/telephone/contactType).",
+                "Add 'Request a quote' page if B2B sales-driven.",
             ],
-            expected_impact="Improves conversion and reduces ‘unclear contact’ outputs.",
+            expected_impact="Improves conversion and reduces 'unclear contact' outputs.",
             measurable_outcome="Next scan shows has_contact = true.",
             why=["Scan evidence: contact path was unclear or missing."],
         ))
@@ -157,7 +157,7 @@ def build_recommendations(
             category="Authority",
             title="Reduce dependency on weak third-party sources",
             action_steps=[
-                "Create 2–3 authoritative profiles that cite the official domain (LinkedIn, Crunchbase, association directory).",
+                "Create 2-3 authoritative profiles that cite the official domain (LinkedIn, Crunchbase, association directory).",
                 "Publish 1 authority asset (case study, certification page, capability sheet) on the official site.",
                 "Correct or remove inaccurate directory listings that outrank/cite competitors.",
             ],

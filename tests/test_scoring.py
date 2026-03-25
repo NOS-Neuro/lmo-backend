@@ -19,6 +19,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scan_engine_real import derive_recommendation
+from core.ras.scoring import interpret
 
 
 class TestDiscoveryScore:
@@ -322,6 +323,22 @@ class TestStrategyRecommendations:
         assert strategy is not None
         assert len(strategy) > 0
         assert "Truth File" in strategy or "schema" in strategy or "Re-scan" in strategy
+
+    def test_strategy_copy_uses_ascii_punctuation(self):
+        _, _, explanation, strategy = derive_recommendation(85, 85, 85)
+        assert "You're" in explanation
+        assert "1-2" in strategy
+
+        _, _, low_explanation, _ = derive_recommendation(20, 20, 20)
+        assert "You'll" in low_explanation
+
+
+class TestScoreBandCopy:
+    def test_confidence_copy_uses_ascii_punctuation(self):
+        assert interpret(90).confidence == "High - low hallucination risk"
+        assert interpret(75).confidence == "Medium - minor risk of errors"
+        assert interpret(60).confidence == "Low - significant hallucination risk"
+        assert interpret(20).confidence == "Very low - unreliable answers expected"
 
 
 class TestEdgeCases:

@@ -22,25 +22,25 @@ SCORE_BANDS = [
     (85, 92, ScoreBand(
         label="Operationally Authoritative",
         description="LLMs will reliably provide accurate, consistent information.",
-        confidence="High — low hallucination risk",
+        confidence="High - low hallucination risk",
         next_steps="Maintain and monitor for drift; keep sources fresh."
     )),
     (70, 84, ScoreBand(
         label="Strong Alignment",
         description="Most LLMs get it right, but some inconsistencies exist.",
-        confidence="Medium — minor risk of errors",
+        confidence="Medium - minor risk of errors",
         next_steps="Focus on consistency, official citations, and coverage gaps."
     )),
     (55, 69, ScoreBand(
         label="Partial Alignment",
         description="LLMs sometimes provide incorrect or conflicting information.",
-        confidence="Low — significant hallucination risk",
+        confidence="Low - significant hallucination risk",
         next_steps="Address critical accuracy gaps and canonical source issues."
     )),
     (0, 54, ScoreBand(
         label="At Risk",
         description="High probability of hallucinations or omissions.",
-        confidence="Very low — unreliable answers expected",
+        confidence="Very low - unreliable answers expected",
         next_steps="Foundational corrections needed: canonical source + structured data + directory cleanup."
     )),
 ]

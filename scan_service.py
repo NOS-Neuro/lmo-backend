@@ -1,16 +1,18 @@
 import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from typing import Any, List, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
+from fastapi import BackgroundTasks, HTTPException
 import requests
 from fastapi import Request
 from slowapi.util import get_remote_address
 
 from config import settings
-from db import insert_competitor_scan
+from db import insert_competitor_scan, insert_main_scan
 from email_service import send_contact_request_notification, send_scan_results_email
+from schemas import QAPair, ScanRequest, ScanResponse
 
 
 logger = logging.getLogger("vizai")
@@ -209,3 +211,120 @@ def process_competitor_scans_in_background(
         "Completed parallel competitor scanning",
         extra={"request_id": request_id, "scan_id": scan_id_str},
     )
+
+
+def execute_run_scan(
+    *,
+    payload: ScanRequest,
+    background_tasks: BackgroundTasks,
+    request_id: str,
+    client_ip: Optional[str],
+    user_agent: Optional[str],
+) -> ScanResponse:
+    """Run the scan, persist results, and enqueue non-critical follow-up work."""
+    scan_id = uuid.uuid4()
+    scan_id_str = str(scan_id)[:8]
+    created_at = datetime.now(timezone.utc)
+
+    logger.info(
+        "Scan start: biz=%s db_url_present=%s ip=%s ua_present=%s competitors=%s questions=%s",
+        payload.businessName,
+        bool(settings.DATABASE_URL),
+        client_ip,
+        bool(user_agent),
+        len(payload.competitors),
+        len(payload.questions),
+        extra={"request_id": request_id, "scan_id": scan_id_str},
+    )
+
+    from scan_engine_real import run_real_scan_perplexity
+
+    raw_llm: Optional[Dict[str, Any]] = None
+    try:
+        custom_questions: Optional[List[Tuple[str, str]]] = None
+        if payload.questions:
+            custom_questions = [(q.prompt_name, q.question) for q in payload.questions]
+
+        result_obj, raw_bundle = run_real_scan_perplexity(
+            business_name=payload.businessName,
+            website=str(payload.website),
+            industry=payload.industry,
+            questions=custom_questions,
+            competitors=[{"name": c.name, "website": str(c.website)} for c in (payload.competitors or [])],
+        )
+
+        raw_llm = raw_bundle
+        qa_pairs = [
+            QAPair(
+                question=run.get("question", ""),
+                answer=run.get("answer_text", ""),
+                prompt_name=run.get("prompt_name"),
+            )
+            for run in raw_bundle.get("runs", [])
+        ]
+
+        result = ScanResponse(
+            scan_id=str(scan_id),
+            created_at=created_at.isoformat(),
+            discovery_score=int(result_obj.discovery_score),
+            accuracy_score=int(result_obj.accuracy_score),
+            authority_score=int(result_obj.authority_score),
+            overall_score=int(result_obj.overall_score),
+            package_recommendation=str(result_obj.package_recommendation),
+            package_explanation=str(result_obj.package_explanation),
+            strategy_summary=str(result_obj.strategy_summary),
+            findings=list(result_obj.findings or []),
+            qa_pairs=qa_pairs,
+            email_sent=False,
+            entity_status=result_obj.entity_status,
+            entity_confidence=result_obj.entity_confidence,
+            warnings=result_obj.warnings,
+        )
+    except Exception as e:
+        logger.exception(
+            "Real scan failed: %s",
+            e,
+            extra={"request_id": request_id, "scan_id": scan_id_str},
+        )
+        raise HTTPException(status_code=500, detail="Scan processing failed. Please try again.")
+
+    if settings.DATABASE_URL:
+        try:
+            insert_main_scan(
+                scan_id=scan_id,
+                created_at=created_at,
+                payload=payload,
+                result=result,
+                raw_llm=raw_llm,
+                ip_address=client_ip,
+                user_agent=user_agent,
+            )
+        except Exception as e:
+            logger.exception(
+                "DB insert failed: %s",
+                e,
+                extra={"request_id": request_id, "scan_id": scan_id_str},
+            )
+            raise HTTPException(status_code=500, detail="Unable to store scan results. Please try again.")
+
+    if settings.email_notifications_enabled:
+        background_tasks.add_task(
+            send_scan_emails_in_background,
+            payload=payload,
+            result=result,
+            scan_id=scan_id,
+            request_id=request_id,
+        )
+
+    competitors_list = payload.competitors or []
+    if settings.DATABASE_URL and competitors_list:
+        background_tasks.add_task(
+            process_competitor_scans_in_background,
+            parent_scan_id=scan_id,
+            created_at=created_at,
+            competitors_list=competitors_list,
+            request_id=request_id,
+            scan_id_str=scan_id_str,
+        )
+
+    return result

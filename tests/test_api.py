@@ -12,8 +12,8 @@ sys.modules.setdefault(
 
 import main
 import routes
-import db
 import scan_service
+import email_service
 
 
 class ASGIResponse:
@@ -172,7 +172,7 @@ def test_run_scan_persists_before_sending_email(monkeypatch):
     monkeypatch.setattr(main.settings, "RESEND_API_KEY", "resend-key")
     monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_FROM", "from@example.com")
     monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_TO", "to@example.com")
-    monkeypatch.setattr(routes, "insert_main_scan", lambda **kwargs: events.append("insert"))
+    monkeypatch.setattr(scan_service, "insert_main_scan", lambda **kwargs: events.append("insert"))
     monkeypatch.setattr(scan_service, "send_scan_results_email", lambda **kwargs: events.append("email") or True)
     monkeypatch.setattr(scan_service, "send_contact_request_notification", lambda **kwargs: events.append("contact") or True)
 
@@ -194,7 +194,7 @@ def test_run_scan_db_failure_returns_generic_error_and_skips_email(monkeypatch):
     monkeypatch.setattr(main.settings, "RESEND_API_KEY", "resend-key")
     monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_FROM", "from@example.com")
     monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_TO", "to@example.com")
-    monkeypatch.setattr(routes, "insert_main_scan", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("secret db failure")))
+    monkeypatch.setattr(scan_service, "insert_main_scan", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("secret db failure")))
     monkeypatch.setattr(scan_service, "send_scan_results_email", lambda **kwargs: email_calls.append("email") or True)
 
     response = request_json(main.app, "POST", "/run_scan", payload=make_payload())
@@ -285,3 +285,27 @@ def test_cors_origins_follow_settings(monkeypatch):
     monkeypatch.setattr(main.settings, "FRONTEND_ORIGIN", "https://vizai.io, https://www.vizai.io")
 
     assert main.settings.cors_allowed_origins == ["https://vizai.io", "https://www.vizai.io"]
+
+
+def test_contact_request_email_copy_is_clean(monkeypatch):
+    sent = {}
+
+    monkeypatch.setattr(main.settings, "RESEND_API_KEY", "resend-key")
+    monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_FROM", "from@example.com")
+    monkeypatch.setattr(main.settings, "NOTIFY_EMAIL_TO", "to@example.com")
+    monkeypatch.setattr(email_service.resend.Emails, "send", lambda params: sent.setdefault("params", params) or {"id": "msg_123"})
+
+    ok = email_service.send_contact_request_notification(
+        business_name="Acme Corp",
+        contact_email="owner@acme.com",
+        website="https://acme.com",
+        industry="Software",
+        scan_id="scan123",
+        overall_score=81,
+    )
+
+    assert ok is True
+    params = sent["params"]
+    assert params["subject"] == "Contact Request: Acme Corp (Score: 81/100)"
+    assert "New Contact Request from Scan" in params["html"]
+    assert "<strong>Next step:</strong>" in params["html"]

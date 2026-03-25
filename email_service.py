@@ -165,7 +165,7 @@ def send_contact_request_notification(
         </head>
         <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #f5f5f5; margin: 0; padding: 20px;">
             <div style="max-width: 600px; margin: 0 auto; background: white; border-radius: 8px; padding: 32px;">
-                <h2 style="color: #7b5cff; margin: 0 0 24px;">ðŸ”” New Contact Request from Scan</h2>
+                <h2 style="color: #7b5cff; margin: 0 0 24px;">New Contact Request from Scan</h2>
                 <div style="background: #f8f9fa; border-left: 4px solid #7b5cff; padding: 16px; margin-bottom: 24px;">
                     <p style="margin: 0; font-weight: bold; color: #333;">Someone wants to discuss improving their results</p>
                 </div>
@@ -179,7 +179,7 @@ def send_contact_request_notification(
                 </table>
                 <div style="margin-top: 32px; padding: 16px; background: #f0f7ff; border-radius: 6px;">
                     <p style="margin: 0; color: #555; font-size: 14px;">
-                        ðŸ’¡ <strong>Next step:</strong> Reply to {contact_email} within 1 business day to discuss their AI visibility needs.
+                        <strong>Next step:</strong> Reply to {contact_email} within 1 business day to discuss their AI visibility needs.
                     </p>
                 </div>
             </div>
@@ -191,7 +191,7 @@ def send_contact_request_notification(
             {
                 "from": settings.NOTIFY_EMAIL_FROM,
                 "to": [settings.NOTIFY_EMAIL_TO],
-                "subject": f"ðŸ”” Contact Request: {business_name} (Score: {overall_score}/100)",
+                "subject": f"Contact Request: {business_name} (Score: {overall_score}/100)",
                 "html": html_content,
                 "reply_to": contact_email,
             }
