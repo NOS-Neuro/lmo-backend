@@ -2,6 +2,7 @@ import logging
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import BackgroundTasks, HTTPException
@@ -10,12 +11,22 @@ from fastapi import Request
 from slowapi.util import get_remote_address
 
 from config import settings
-from db import insert_competitor_scan, insert_main_scan
+from db import (
+    create_pending_scan,
+    insert_competitor_scan,
+    insert_main_scan,
+    mark_scan_failed,
+    update_main_scan_result,
+)
 from email_service import send_contact_request_notification, send_scan_results_email
 from schemas import QAPair, ScanRequest, ScanResponse
 
 
 logger = logging.getLogger("vizai")
+
+
+def _duration_ms(start_time: float) -> int:
+    return int((time.perf_counter() - start_time) * 1000)
 
 
 def get_client_ip_from_request(request: Request) -> str:
@@ -220,65 +231,76 @@ def execute_run_scan(
     request_id: str,
     client_ip: Optional[str],
     user_agent: Optional[str],
+    async_mode: bool = False,
 ) -> ScanResponse:
     """Run the scan, persist results, and enqueue non-critical follow-up work."""
     scan_id = uuid.uuid4()
     scan_id_str = str(scan_id)[:8]
     created_at = datetime.now(timezone.utc)
+    request_started = time.perf_counter()
 
     logger.info(
-        "Scan start: biz=%s db_url_present=%s ip=%s ua_present=%s competitors=%s questions=%s",
+        "Scan start: biz=%s db_url_present=%s ip=%s ua_present=%s competitors=%s questions=%s async_mode=%s",
         payload.businessName,
         bool(settings.DATABASE_URL),
         client_ip,
         bool(user_agent),
         len(payload.competitors),
         len(payload.questions),
+        async_mode,
         extra={"request_id": request_id, "scan_id": scan_id_str},
     )
 
-    from scan_engine_real import run_real_scan_perplexity
+    if async_mode:
+        if not settings.SCAN_ASYNC_ENABLED:
+            raise HTTPException(status_code=503, detail="Async scan mode is currently unavailable.")
+        if not settings.DATABASE_URL:
+            raise HTTPException(status_code=501, detail="Async scan mode requires database support.")
 
-    raw_llm: Optional[Dict[str, Any]] = None
-    try:
-        custom_questions: Optional[List[Tuple[str, str]]] = None
-        if payload.questions:
-            custom_questions = [(q.prompt_name, q.question) for q in payload.questions]
+        try:
+            create_pending_scan(
+                scan_id=scan_id,
+                created_at=created_at,
+                payload=payload,
+                ip_address=client_ip,
+                user_agent=user_agent,
+            )
+        except Exception as e:
+            logger.exception(
+                "Pending scan insert failed: %s",
+                e,
+                extra={"request_id": request_id, "scan_id": scan_id_str},
+            )
+            raise HTTPException(status_code=500, detail="Unable to create scan job. Please try again.")
 
-        result_obj, raw_bundle = run_real_scan_perplexity(
-            business_name=payload.businessName,
-            website=str(payload.website),
-            industry=payload.industry,
-            questions=custom_questions,
-            competitors=[{"name": c.name, "website": str(c.website)} for c in (payload.competitors or [])],
+        background_tasks.add_task(
+            run_scan_job_in_background,
+            scan_id=scan_id,
+            created_at=created_at,
+            payload=payload,
+            request_id=request_id,
+            client_ip=client_ip,
+            user_agent=user_agent,
         )
 
-        raw_llm = raw_bundle
-        qa_pairs = [
-            QAPair(
-                question=run.get("question", ""),
-                answer=run.get("answer_text", ""),
-                prompt_name=run.get("prompt_name"),
-            )
-            for run in raw_bundle.get("runs", [])
-        ]
+        logger.info(
+            "Async scan accepted in %sms",
+            _duration_ms(request_started),
+            extra={"request_id": request_id, "scan_id": scan_id_str},
+        )
+        return {
+            "scan_id": str(scan_id),
+            "status": "processing",
+            "created_at": created_at.isoformat(),
+        }
 
-        result = ScanResponse(
-            scan_id=str(scan_id),
-            created_at=created_at.isoformat(),
-            discovery_score=int(result_obj.discovery_score),
-            accuracy_score=int(result_obj.accuracy_score),
-            authority_score=int(result_obj.authority_score),
-            overall_score=int(result_obj.overall_score),
-            package_recommendation=str(result_obj.package_recommendation),
-            package_explanation=str(result_obj.package_explanation),
-            strategy_summary=str(result_obj.strategy_summary),
-            findings=list(result_obj.findings or []),
-            qa_pairs=qa_pairs,
-            email_sent=False,
-            entity_status=result_obj.entity_status,
-            entity_confidence=result_obj.entity_confidence,
-            warnings=result_obj.warnings,
+    try:
+        result, raw_llm = _perform_scan(
+            scan_id=scan_id,
+            created_at=created_at,
+            payload=payload,
+            request_id=request_id,
+            scan_id_str=scan_id_str,
         )
     except Exception as e:
         logger.exception(
@@ -293,6 +315,7 @@ def execute_run_scan(
             insert_main_scan(
                 scan_id=scan_id,
                 created_at=created_at,
+                completed_at=datetime.now(timezone.utc),
                 payload=payload,
                 result=result,
                 raw_llm=raw_llm,
@@ -327,4 +350,139 @@ def execute_run_scan(
             scan_id_str=scan_id_str,
         )
 
+    logger.info(
+        "Scan request completed in %sms",
+        _duration_ms(request_started),
+        extra={"request_id": request_id, "scan_id": scan_id_str},
+    )
     return result
+
+
+def _perform_scan(
+    *,
+    scan_id: uuid.UUID,
+    created_at: datetime,
+    payload: ScanRequest,
+    request_id: str,
+    scan_id_str: str,
+) -> Tuple[ScanResponse, Optional[Dict[str, Any]]]:
+    from scan_engine_real import run_real_scan_perplexity
+
+    engine_started = time.perf_counter()
+    raw_llm: Optional[Dict[str, Any]] = None
+
+    custom_questions: Optional[List[Tuple[str, str]]] = None
+    if payload.questions:
+        custom_questions = [(q.prompt_name, q.question) for q in payload.questions]
+
+    result_obj, raw_bundle = run_real_scan_perplexity(
+        business_name=payload.businessName,
+        website=str(payload.website),
+        industry=payload.industry,
+        questions=custom_questions,
+        competitors=[{"name": c.name, "website": str(c.website)} for c in (payload.competitors or [])],
+    )
+
+    raw_llm = raw_bundle
+    qa_pairs = [
+        QAPair(
+            question=run.get("question", ""),
+            answer=run.get("answer_text", ""),
+            prompt_name=run.get("prompt_name"),
+        )
+        for run in raw_bundle.get("runs", [])
+    ]
+
+    result = ScanResponse(
+        scan_id=str(scan_id),
+        created_at=created_at.isoformat(),
+        discovery_score=int(result_obj.discovery_score),
+        accuracy_score=int(result_obj.accuracy_score),
+        authority_score=int(result_obj.authority_score),
+        overall_score=int(result_obj.overall_score),
+        package_recommendation=str(result_obj.package_recommendation),
+        package_explanation=str(result_obj.package_explanation),
+        strategy_summary=str(result_obj.strategy_summary),
+        findings=list(result_obj.findings or []),
+        qa_pairs=qa_pairs,
+        email_sent=False,
+        entity_status=result_obj.entity_status,
+        entity_confidence=result_obj.entity_confidence,
+        warnings=result_obj.warnings,
+    )
+
+    logger.info(
+        "Core scan completed in %sms",
+        _duration_ms(engine_started),
+        extra={"request_id": request_id, "scan_id": scan_id_str},
+    )
+    return result, raw_llm
+
+
+def run_scan_job_in_background(
+    *,
+    scan_id: uuid.UUID,
+    created_at: datetime,
+    payload: ScanRequest,
+    request_id: str,
+    client_ip: Optional[str],
+    user_agent: Optional[str],
+) -> None:
+    scan_id_str = str(scan_id)[:8]
+    job_started = time.perf_counter()
+
+    try:
+        result, raw_llm = _perform_scan(
+            scan_id=scan_id,
+            created_at=created_at,
+            payload=payload,
+            request_id=request_id,
+            scan_id_str=scan_id_str,
+        )
+        update_main_scan_result(
+            scan_id=scan_id,
+            completed_at=datetime.now(timezone.utc),
+            result=result,
+            raw_llm=raw_llm,
+        )
+
+        if settings.email_notifications_enabled:
+            send_scan_emails_in_background(
+                payload=payload,
+                result=result,
+                scan_id=scan_id,
+                request_id=request_id,
+            )
+
+        competitors_list = payload.competitors or []
+        if settings.DATABASE_URL and competitors_list:
+            process_competitor_scans_in_background(
+                parent_scan_id=scan_id,
+                created_at=created_at,
+                competitors_list=competitors_list,
+                request_id=request_id,
+                scan_id_str=scan_id_str,
+            )
+
+        logger.info(
+            "Async scan job completed in %sms",
+            _duration_ms(job_started),
+            extra={"request_id": request_id, "scan_id": scan_id_str},
+        )
+    except Exception as e:
+        logger.exception(
+            "Async scan job failed: %s",
+            e,
+            extra={"request_id": request_id, "scan_id": scan_id_str},
+        )
+        try:
+            mark_scan_failed(
+                scan_id=scan_id,
+                completed_at=datetime.now(timezone.utc),
+                failure_message="Scan processing failed. Please try again.",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to persist async scan failure",
+                extra={"request_id": request_id, "scan_id": scan_id_str},
+            )

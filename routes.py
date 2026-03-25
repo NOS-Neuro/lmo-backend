@@ -2,12 +2,13 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from slowapi import Limiter
 
 from config import settings
-from db import get_db_conn, return_db_conn
-from schemas import ScanRequest, ScanResponse
+from db import get_db_conn, get_scan_record, return_db_conn
+from schemas import ScanRequest, ScanResponse, ScanStatusResponse
 from scan_service import (
     execute_run_scan,
     get_client_ip_from_request,
@@ -63,7 +64,12 @@ def health():
 
 @router.post("/run_scan", response_model=ScanResponse)
 @limiter.limit("10/minute")
-def run_scan(payload: ScanRequest, request: Request, background_tasks: BackgroundTasks):
+def run_scan(
+    payload: ScanRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+    async_mode: bool = Query(default=False),
+):
     request_id = getattr(request.state, "request_id", "-")
 
     try:
@@ -86,13 +92,59 @@ def run_scan(payload: ScanRequest, request: Request, background_tasks: Backgroun
             detail="CAPTCHA verification failed. Please refresh the page and try again.",
         )
 
-    return execute_run_scan(
+    response = execute_run_scan(
         payload=payload,
         background_tasks=background_tasks,
         request_id=request_id,
         client_ip=client_ip,
         user_agent=user_agent,
+        async_mode=async_mode,
     )
+    if async_mode:
+        return JSONResponse(status_code=202, content=response, background=background_tasks)
+    return response
+
+
+@router.get("/scan/{scan_id}", response_model=ScanStatusResponse)
+def get_scan_status(scan_id: str):
+    if not settings.DATABASE_URL:
+        raise HTTPException(status_code=501, detail="Database not configured")
+
+    try:
+        scan_uuid = uuid.UUID(scan_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid scan ID")
+
+    record = get_scan_record(scan_uuid)
+    if not record:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    status = str(record["scan_status"] or "completed")
+    response = {
+        "scan_id": scan_id,
+        "status": status,
+        "created_at": record["created_at"].isoformat() if record["created_at"] else None,
+        "completed_at": record["completed_at"].isoformat() if record["completed_at"] else None,
+        "failure_message": record["failure_message"],
+        "result": None,
+    }
+
+    if status == "completed":
+        response["result"] = {
+            "scan_id": scan_id,
+            "created_at": response["created_at"],
+            "discovery_score": int(record["discovery_score"] or 0),
+            "accuracy_score": int(record["accuracy_score"] or 0),
+            "authority_score": int(record["authority_score"] or 0),
+            "overall_score": int(record["overall_score"] or 0),
+            "package_recommendation": str(record["package_recommendation"] or ""),
+            "package_explanation": str(record["package_explanation"] or ""),
+            "strategy_summary": str(record["strategy_summary"] or ""),
+            "findings": list(record["findings"] or []),
+            "email_sent": bool(record["email_sent"]),
+        }
+
+    return response
 
 
 @router.get("/scan/{scan_id}/competitors")

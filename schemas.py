@@ -67,3 +67,12 @@ class ScanResponse(BaseModel):
         "This scan is evidence-based when run in Real Scan mode. "
         "Fallback mode is an honest AI-assisted estimate."
     )
+
+
+class ScanStatusResponse(BaseModel):
+    scan_id: str
+    status: str
+    created_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    failure_message: Optional[str] = None
+    result: Optional[ScanResponse] = None

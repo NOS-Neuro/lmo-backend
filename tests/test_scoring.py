@@ -10,6 +10,7 @@ Tests cover:
 """
 import pytest
 from typing import Dict, Any
+from requests.exceptions import Timeout
 
 
 # Import the scoring function - we'll need to extract it first
@@ -18,7 +19,8 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scan_engine_real import derive_recommendation
+from scan_engine_real import derive_recommendation, run_real_scan_perplexity
+import scan_engine_real
 from core.ras.scoring import interpret
 
 
@@ -257,6 +259,52 @@ class TestPackageRecommendation:
         assert overall < 40
         assert "Standard LMO + Add-Ons" in package
         assert "foundational" in explanation.lower() or "weak" in explanation.lower()
+
+
+def test_run_real_scan_perplexity_allows_partial_results_and_records_timings(monkeypatch):
+    monkeypatch.setattr(scan_engine_real.settings, "PERPLEXITY_API_KEY", "test-key")
+    monkeypatch.setattr(scan_engine_real.settings, "OPENAI_API_KEY", None)
+    monkeypatch.setattr(scan_engine_real.settings, "SCAN_QUERY_MAX_WORKERS", 2)
+
+    def fake_chat_web(self, *, system, user, max_tokens=650, max_retries=None):
+        if "Question 2" in user:
+            raise Timeout("slow provider")
+        return (
+            "Acme Corp is based in Toronto. Contact acme.com.",
+            [scan_engine_real.PerplexityHit(title="Acme", url="https://acme.com")],
+            {"ok": True},
+        )
+
+    monkeypatch.setattr(scan_engine_real.PerplexityClient, "chat_web", fake_chat_web)
+
+    result, raw_bundle = run_real_scan_perplexity(
+        business_name="Acme Corp",
+        website="https://acme.com",
+        questions=[("q1", "Question 1"), ("q2", "Question 2")],
+    )
+
+    assert result.overall_score >= 0
+    assert raw_bundle["timings"]["query_success_count"] == 1
+    assert raw_bundle["timings"]["query_error_count"] == 1
+    assert raw_bundle["timings"]["queries"][0]["status"] in {"ok", "error"}
+    assert "total_seconds" in raw_bundle["timings"]
+
+
+def test_run_real_scan_perplexity_raises_when_all_queries_fail(monkeypatch):
+    monkeypatch.setattr(scan_engine_real.settings, "PERPLEXITY_API_KEY", "test-key")
+    monkeypatch.setattr(scan_engine_real.settings, "OPENAI_API_KEY", None)
+
+    def fake_chat_web(self, *, system, user, max_tokens=650, max_retries=None):
+        raise Timeout("slow provider")
+
+    monkeypatch.setattr(scan_engine_real.PerplexityClient, "chat_web", fake_chat_web)
+
+    with pytest.raises(RuntimeError, match="no successful results"):
+        run_real_scan_perplexity(
+            business_name="Acme Corp",
+            website="https://acme.com",
+            questions=[("q1", "Question 1")],
+        )
 
     def test_boundary_case_exactly_80(self):
         """Exactly 80 should be Basic LMO"""

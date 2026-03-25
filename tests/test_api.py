@@ -3,6 +3,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 sys.modules.setdefault(
@@ -28,6 +29,8 @@ class ASGIResponse:
 
 def request_json(app, method, path, payload=None, headers=None):
     async def _run():
+        parsed = urlsplit(path)
+        clean_path = parsed.path or path
         body = b""
         raw_headers = []
         if payload is not None:
@@ -43,9 +46,9 @@ def request_json(app, method, path, payload=None, headers=None):
             "http_version": "1.1",
             "method": method,
             "scheme": "http",
-            "path": path,
-            "raw_path": path.encode("utf-8"),
-            "query_string": b"",
+            "path": clean_path,
+            "raw_path": clean_path.encode("utf-8"),
+            "query_string": parsed.query.encode("utf-8"),
             "headers": raw_headers,
             "client": ("testclient", 123),
             "server": ("testserver", 80),
@@ -183,6 +186,27 @@ def test_run_scan_persists_before_sending_email(monkeypatch):
     assert response.json()["email_sent"] is False
 
 
+def test_run_scan_async_mode_returns_processing(monkeypatch):
+    reset_limiter()
+    configure_scan_success(monkeypatch)
+
+    events = []
+
+    monkeypatch.setattr(routes, "verify_turnstile", lambda token, remote_ip=None: True)
+    monkeypatch.setattr(main.settings, "DATABASE_URL", "postgres://db")
+    monkeypatch.setattr(main.settings, "SCAN_ASYNC_ENABLED", True)
+    monkeypatch.setattr(scan_service, "create_pending_scan", lambda **kwargs: events.append("pending"))
+    monkeypatch.setattr(scan_service, "run_scan_job_in_background", lambda **kwargs: events.append("background"))
+
+    response = request_json(main.app, "POST", "/run_scan?async_mode=true", payload=make_payload())
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "processing"
+    assert "scan_id" in body
+    assert events == ["pending", "background"]
+
+
 def test_run_scan_db_failure_returns_generic_error_and_skips_email(monkeypatch):
     reset_limiter()
     configure_scan_success(monkeypatch)
@@ -279,6 +303,75 @@ def test_get_scan_competitors_returns_rows(monkeypatch):
     assert body["count"] == 2
     assert body["competitors"][0]["name"] == "Competitor A"
     assert body["competitors"][0]["scores"]["overall"] == 72
+
+
+def test_get_scan_status_processing(monkeypatch):
+    created_at = datetime.now(timezone.utc)
+    scan_id = str(uuid4())
+
+    monkeypatch.setattr(main.settings, "DATABASE_URL", "postgres://db")
+    monkeypatch.setattr(
+        routes,
+        "get_scan_record",
+        lambda scan_uuid: {
+            "scan_id": scan_id,
+            "created_at": created_at,
+            "completed_at": None,
+            "failure_message": None,
+            "scan_status": "processing",
+            "discovery_score": 0,
+            "accuracy_score": 0,
+            "authority_score": 0,
+            "overall_score": 0,
+            "package_recommendation": "Pending",
+            "package_explanation": "Pending",
+            "strategy_summary": "Pending",
+            "findings": [],
+            "email_sent": False,
+        },
+    )
+
+    response = request_json(main.app, "GET", f"/scan/{scan_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "processing"
+    assert body["result"] is None
+
+
+def test_get_scan_status_completed_returns_result(monkeypatch):
+    created_at = datetime.now(timezone.utc)
+    completed_at = datetime.now(timezone.utc)
+    scan_id = str(uuid4())
+
+    monkeypatch.setattr(main.settings, "DATABASE_URL", "postgres://db")
+    monkeypatch.setattr(
+        routes,
+        "get_scan_record",
+        lambda scan_uuid: {
+            "scan_id": scan_id,
+            "created_at": created_at,
+            "completed_at": completed_at,
+            "failure_message": None,
+            "scan_status": "completed",
+            "discovery_score": 81,
+            "accuracy_score": 79,
+            "authority_score": 77,
+            "overall_score": 79,
+            "package_recommendation": "Standard LMO",
+            "package_explanation": "Explanation",
+            "strategy_summary": "Strategy",
+            "findings": ["Finding 1"],
+            "email_sent": False,
+        },
+    )
+
+    response = request_json(main.app, "GET", f"/scan/{scan_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["result"]["overall_score"] == 79
 
 
 def test_cors_origins_follow_settings(monkeypatch):

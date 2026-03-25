@@ -332,8 +332,9 @@ class PerplexityClient:
         system: str,
         user: str,
         max_tokens: int = 650,
-        max_retries: int = 3,
+        max_retries: Optional[int] = None,
     ) -> Tuple[str, List[PerplexityHit], Dict[str, Any]]:
+        max_retries = max_retries or settings.PERPLEXITY_MAX_RETRIES
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -573,6 +574,7 @@ def run_real_scan_perplexity(
     competitors:
       Accepted and stored for future use, but not executed here unless you explicitly want it.
     """
+    scan_started = time.perf_counter()
 
     client = PerplexityClient(
         api_key=settings.PERPLEXITY_API_KEY,
@@ -609,6 +611,7 @@ def run_real_scan_perplexity(
             "runs": [],
             "notes": [],
         },
+        "timings": {},
     }
 
     system = (
@@ -618,8 +621,9 @@ def run_real_scan_perplexity(
     )
 
     # Define function to run a single query (for parallel execution)
-    def run_single_query(prompt_name: str, question: str) -> Tuple[str, str, str, List[PerplexityHit], Any]:
+    def run_single_query(prompt_name: str, question: str) -> Tuple[str, str, str, List[PerplexityHit], Any, int]:
         """Execute a single Perplexity query and return results"""
+        query_started = time.perf_counter()
         industry_context = f"\nIndustry: {industry}" if industry else ""
         user = (
             f"Company name: {business_name}{industry_context}\n\n"
@@ -631,13 +635,16 @@ def run_real_scan_perplexity(
         )
 
         answer, hits, raw = client.chat_web(system=system, user=user, max_tokens=450)
-        return prompt_name, question, answer, hits, raw
+        duration_ms = int((time.perf_counter() - query_started) * 1000)
+        logger.info("Scan query completed: %s in %sms", prompt_name, duration_ms)
+        return prompt_name, question, answer, hits, raw, duration_ms
 
     # Execute all queries in parallel for 5-7x speedup
     logger.info("Starting parallel execution of %d queries", len(qs))
     start_time = time.time()
+    query_timings: List[Dict[str, Any]] = []
 
-    with ThreadPoolExecutor(max_workers=min(len(qs), 10)) as executor:
+    with ThreadPoolExecutor(max_workers=min(len(qs), settings.SCAN_QUERY_MAX_WORKERS)) as executor:
         # Submit all queries
         future_to_query = {
             executor.submit(run_single_query, prompt_name, q): (prompt_name, q)
@@ -646,8 +653,9 @@ def run_real_scan_perplexity(
 
         # Collect results as they complete
         for future in as_completed(future_to_query):
+            prompt_name, question = future_to_query[future]
             try:
-                prompt_name, question, answer, hits, raw = future.result()
+                prompt_name, question, answer, hits, raw, duration_ms = future.result()
 
                 provider_results.append(
                     ProviderResult(
@@ -669,12 +677,35 @@ def run_real_scan_perplexity(
                         "raw": raw,
                     }
                 )
+                query_timings.append(
+                    {
+                        "prompt_name": prompt_name,
+                        "status": "ok",
+                        "duration_ms": duration_ms,
+                        "citation_count": len(hits),
+                    }
+                )
             except Exception as e:
-                logger.error(f"Query failed for {future_to_query[future][0]}: {e}")
+                logger.warning("Query failed for %s: %s", prompt_name, e)
+                query_timings.append(
+                    {
+                        "prompt_name": prompt_name,
+                        "status": "error",
+                        "duration_ms": 0,
+                        "error": str(e),
+                    }
+                )
                 # Continue with other queries even if one fails
 
     elapsed = time.time() - start_time
     logger.info("Parallel query execution completed in %.2f seconds", elapsed)
+    raw_bundle["timings"]["query_execution_seconds"] = round(elapsed, 3)
+    raw_bundle["timings"]["queries"] = query_timings
+    raw_bundle["timings"]["query_success_count"] = len(provider_results)
+    raw_bundle["timings"]["query_error_count"] = len(qs) - len(provider_results)
+
+    if not provider_results:
+        raise RuntimeError("Scan provider returned no successful results")
 
     # -----------------------------
     # Aggregate evidence
@@ -709,6 +740,7 @@ def run_real_scan_perplexity(
     # Optional Validator Layer (OpenAI evaluates Perplexity evidence)
     # -----------------------------
     if settings.OPENAI_API_KEY:
+        validation_started = time.perf_counter()
         try:
             validator = OpenAIValidator(
                 api_key=settings.OPENAI_API_KEY,
@@ -734,8 +766,11 @@ def run_real_scan_perplexity(
         except Exception as e:
             raw_bundle["validation"]["notes"].append(f"Validator error (non-fatal): {str(e)}")
             logger.warning(f"OpenAI validator error (non-fatal): {e}")
+        finally:
+            raw_bundle["timings"]["validation_seconds"] = round(time.perf_counter() - validation_started, 3)
     else:
         raw_bundle["validation"]["notes"].append("Validation skipped: no OPENAI_API_KEY")
+        raw_bundle["timings"]["validation_seconds"] = 0.0
 
     mentions_name = _contains_name(all_text, business_name)
     mentions_domain = bool(biz_domain and biz_domain in _norm(all_text))
@@ -869,6 +904,7 @@ def run_real_scan_perplexity(
     # -----------------------------
     # Metrics
     # -----------------------------
+    scoring_started = time.perf_counter()
     metrics: Dict[str, Any] = {
         "engine": raw_bundle["engine"],
         "provider": "perplexity",
@@ -895,6 +931,7 @@ def run_real_scan_perplexity(
         },
         "gating_warnings": warnings,
     }
+    raw_bundle["timings"]["scoring_seconds"] = round(time.perf_counter() - scoring_started, 3)
 
     # -----------------------------
     # Evidence → Signals → Recommendations
@@ -974,6 +1011,14 @@ def run_real_scan_perplexity(
         "authority": int(authority),
         "overall": int(overall),
     }
+    raw_bundle["timings"]["total_seconds"] = round(time.perf_counter() - scan_started, 3)
+    logger.info(
+        "Scan engine timings: total=%ss query=%ss validation=%ss scoring=%ss",
+        raw_bundle["timings"]["total_seconds"],
+        raw_bundle["timings"]["query_execution_seconds"],
+        raw_bundle["timings"]["validation_seconds"],
+        raw_bundle["timings"]["scoring_seconds"],
+    )
 
     result = RealScanResult(
         discovery_score=int(discovery),

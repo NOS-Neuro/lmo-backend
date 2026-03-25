@@ -60,6 +60,12 @@ class Settings(BaseSettings):
         le=300,
         description="Perplexity API timeout in seconds (10-300, default: 90)"
     )
+    PERPLEXITY_MAX_RETRIES: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Maximum Perplexity retries per query"
+    )
 
     # Database settings
     DATABASE_URL: Optional[str] = Field(
@@ -111,6 +117,16 @@ class Settings(BaseSettings):
         ge=1,
         le=10,
         description="Maximum parallel workers for competitor scans (1-10)"
+    )
+    SCAN_QUERY_MAX_WORKERS: int = Field(
+        default=6,
+        ge=1,
+        le=10,
+        description="Maximum parallel workers for primary scan queries (1-10)"
+    )
+    SCAN_ASYNC_ENABLED: bool = Field(
+        default=True,
+        description="Allow opt-in async scan execution with polling"
     )
     
     model_config = SettingsConfigDict(
