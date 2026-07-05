@@ -583,10 +583,11 @@ class PerplexityClient:
                     timeout=self.timeout
                 )
                 if r.status_code < 200 or r.status_code >= 300:
-                    # Don't retry on 4xx errors (client errors)
-                    if 400 <= r.status_code < 500:
+                    # Don't retry on 4xx errors (client errors), except 429 which is
+                    # transient rate-limiting and should back off and retry like 5xx.
+                    if 400 <= r.status_code < 500 and r.status_code != 429:
                         raise RuntimeError(f"Perplexity API error {r.status_code}: {r.text}")
-                    # Retry on 5xx errors (server errors)
+                    # Retry on 429/5xx errors (rate limit / server errors)
                     last_error = RuntimeError(f"Perplexity API error {r.status_code}: {r.text}")
                     if attempt < max_retries - 1:
                         wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
