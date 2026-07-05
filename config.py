@@ -99,6 +99,24 @@ class Settings(BaseSettings):
         description="To email address for notifications"
     )
 
+    # Platform forwarding (WP-22, decision D1 — single lead store)
+    # When configured, completed scans are forwarded to the Vizai-discovery
+    # platform intake endpoint so Postgres there is the source of truth for leads.
+    VIZAI_PLATFORM_URL: Optional[str] = Field(
+        default=None,
+        description="Base URL of the Vizai-discovery platform (e.g. https://app.vizai.io)"
+    )
+    VIZAI_PLATFORM_API_KEY: Optional[str] = Field(
+        default=None,
+        description="Service API key for the platform intake endpoint (matches VIZAI_SERVICE_API_KEY)"
+    )
+    PLATFORM_FORWARD_TIMEOUT: int = Field(
+        default=10,
+        ge=1,
+        le=60,
+        description="Timeout (seconds) for forwarding scan results to the platform"
+    )
+
     # Frontend settings
     FRONTEND_ORIGIN: str = Field(
         default=",".join(DEFAULT_CORS_ORIGINS),
@@ -188,6 +206,11 @@ class Settings(BaseSettings):
             and self.NOTIFY_EMAIL_FROM
             and self.NOTIFY_EMAIL_TO
         )
+
+    @property
+    def platform_forward_enabled(self) -> bool:
+        """Check if scan forwarding to the Vizai-discovery platform is configured."""
+        return bool(self.VIZAI_PLATFORM_URL and self.VIZAI_PLATFORM_API_KEY)
 
     @property
     def database_enabled(self) -> bool:

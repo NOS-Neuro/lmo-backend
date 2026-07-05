@@ -20,6 +20,7 @@ from db import (
     update_main_scan_result,
 )
 from email_service import send_contact_request_notification, send_scan_results_email
+from platform_forward import forward_scan_to_platform
 from schemas import QAPair, ScanRequest, ScanResponse
 
 
@@ -353,6 +354,18 @@ def execute_run_scan(
             request_id=request_id,
         )
 
+    # WP-22 (D1): forward lead + result to Vizai-discovery (single lead store).
+    # Fire-and-forget — never affects the user-facing scan response.
+    if settings.platform_forward_enabled:
+        background_tasks.add_task(
+            forward_scan_to_platform,
+            payload=payload,
+            result=result,
+            scan_id=scan_id,
+            created_at=created_at,
+            request_id=request_id,
+        )
+
     competitors_list = payload.competitors or []
     if settings.DATABASE_URL and competitors_list:
         background_tasks.add_task(
@@ -485,6 +498,17 @@ def run_scan_job_in_background(
                 competitors_list=competitors_list,
                 request_id=request_id,
                 scan_id_str=scan_id_str,
+            )
+
+        # WP-22 (D1): forward lead + result to Vizai-discovery (single lead store).
+        # Already in a background job — call directly; never raises.
+        if settings.platform_forward_enabled:
+            forward_scan_to_platform(
+                payload=payload,
+                result=result,
+                scan_id=scan_id,
+                created_at=created_at,
+                request_id=request_id,
             )
 
         logger.info(
