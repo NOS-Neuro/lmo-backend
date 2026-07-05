@@ -630,6 +630,43 @@ class PerplexityClient:
         return answer, hits, data
 
 
+def _openai_fallback_answer(
+    *, system: str, user: str, max_tokens: int
+) -> Tuple[str, List[PerplexityHit], Dict[str, Any]]:
+    """
+    Fallback query path used only when Perplexity fails (e.g. quota exhausted).
+    Plain OpenAI chat completion with no web search tool, so it returns no
+    citations and the answer is not web-verified.
+    """
+    headers = {
+        "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": settings.OPENAI_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": system + " You do not have web access; say 'unclear' rather than guessing.",
+            },
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.2,
+        "max_tokens": max_tokens,
+    }
+    r = requests.post(
+        "https://api.openai.com/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=settings.PERPLEXITY_TIMEOUT,
+    )
+    if r.status_code < 200 or r.status_code >= 300:
+        raise RuntimeError(f"OpenAI fallback error {r.status_code}: {r.text}")
+    data = r.json()
+    answer = data["choices"][0]["message"]["content"]
+    return answer, [], data
+
+
 # -----------------------------
 # OpenAI Validator (evidence consistency checker ONLY)
 # -----------------------------
@@ -843,7 +880,7 @@ def run_real_scan_perplexity(
     )
 
     # Define function to run a single query (for parallel execution)
-    def run_single_query(prompt_name: str, question: str) -> Tuple[str, str, str, List[PerplexityHit], Any, int]:
+    def run_single_query(prompt_name: str, question: str) -> Tuple[str, str, str, List[PerplexityHit], Any, int, str]:
         """Execute a single Perplexity query and return results"""
         query_started = time.perf_counter()
         industry_context = f"\nIndustry: {industry}" if industry else ""
@@ -856,10 +893,22 @@ def run_real_scan_perplexity(
             f"- Keep output concise.\n"
         )
 
-        answer, hits, raw = client.chat_web(system=system, user=user, max_tokens=450)
+        try:
+            answer, hits, raw = client.chat_web(system=system, user=user, max_tokens=450)
+            provider_used = "perplexity"
+        except Exception as e:
+            if not settings.OPENAI_API_KEY:
+                raise
+            logger.warning(
+                "Perplexity query failed for %s (%s); falling back to OpenAI (no web verification)",
+                prompt_name, e,
+            )
+            answer, hits, raw = _openai_fallback_answer(system=system, user=user, max_tokens=450)
+            provider_used = "openai_fallback"
+
         duration_ms = int((time.perf_counter() - query_started) * 1000)
-        logger.info("Scan query completed: %s in %sms", prompt_name, duration_ms)
-        return prompt_name, question, answer, hits, raw, duration_ms
+        logger.info("Scan query completed: %s in %sms (provider=%s)", prompt_name, duration_ms, provider_used)
+        return prompt_name, question, answer, hits, raw, duration_ms, provider_used
 
     # Execute all queries in parallel for 5-7x speedup
     logger.info("Starting parallel execution of %d queries", len(qs))
@@ -877,12 +926,12 @@ def run_real_scan_perplexity(
         for future in as_completed(future_to_query):
             prompt_name, question = future_to_query[future]
             try:
-                prompt_name, question, answer, hits, raw, duration_ms = future.result()
+                prompt_name, question, answer, hits, raw, duration_ms, provider_used = future.result()
 
                 provider_results.append(
                     ProviderResult(
-                        provider="perplexity",
-                        model=settings.PERPLEXITY_MODEL,
+                        provider=provider_used,
+                        model=settings.PERPLEXITY_MODEL if provider_used == "perplexity" else settings.OPENAI_MODEL,
                         prompt_name=prompt_name,
                         question=question,
                         answer_text=answer,
@@ -897,14 +946,16 @@ def run_real_scan_perplexity(
                         "answer_text": answer,
                         "search_results": [h.__dict__ for h in hits],
                         "raw": raw,
+                        "provider": provider_used,
                     }
                 )
                 query_timings.append(
                     {
                         "prompt_name": prompt_name,
-                        "status": "ok",
+                        "status": "ok" if provider_used == "perplexity" else "fallback",
                         "duration_ms": duration_ms,
                         "citation_count": len(hits),
+                        "provider": provider_used,
                     }
                 )
             except Exception as e:
